@@ -385,3 +385,39 @@ func TestOnTextMessageWithNoCallbackIsSafe(t *testing.T) {
 	c := &Client{cfg: Config{Channel: "agents"}}
 	c.deliverText(envelope{Command: "on_text_message", Channel: "agents", Text: "hi"})
 }
+
+// Zello spells the field `streamId` on on_transcription and `stream_id` on the
+// stream events. Decoding only the second meant every transcript claimed stream
+// 0, matched no message, and was silently discarded.
+func TestTranscriptStreamAcceptsEitherSpelling(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		raw  string
+		want uint32
+	}{
+		{"camelCase, as on_transcription sends it", `{"command":"on_transcription","streamId":30319}`, 30319},
+		{"snake_case stays authoritative", `{"command":"on_transcription","stream_id":22370}`, 22370},
+		{"snake_case wins when both are present", `{"command":"on_transcription","stream_id":1,"streamId":2}`, 1},
+		{"neither present is still zero", `{"command":"on_transcription"}`, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var e envelope
+			if err := json.Unmarshal([]byte(c.raw), &e); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got := e.transcriptStream(); got != c.want {
+				t.Fatalf("stream id: got %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func TestTranscriptCarriesConfidence(t *testing.T) {
+	var e envelope
+	if err := json.Unmarshal([]byte(`{"command":"on_transcription","streamId":7,"confidence":0.9456}`), &e); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if e.Confidence < 0.94 || e.Confidence > 0.95 {
+		t.Fatalf("confidence not decoded: %v", e.Confidence)
+	}
+}

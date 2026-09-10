@@ -41,9 +41,14 @@ type Incoming struct {
 }
 
 type Transcript struct {
-	StreamID  uint32
-	Text      string
-	Truncated bool
+	StreamID uint32
+	Text     string
+	// Confidence is Zello's own, between 0 and 1. It is the only measure of
+	// audio quality either end of this hotline has, and the question that
+	// produced this field was whether a sentence that does not parse was
+	// misheard or meant.
+	Confidence float64
+	Truncated  bool
 }
 
 // TextMessage is a message someone typed rather than spoke. Zello delivers it
@@ -107,9 +112,17 @@ type envelope struct {
 	CodecHeader    string  `json:"codec_header"`
 	PacketDuration float64 `json:"packet_duration"`
 	StreamID       uint32  `json:"stream_id"`
-	From           string  `json:"from"`
-	Text           string  `json:"text"`
-	Truncated      bool    `json:"truncated"`
+	// Zello names this field `stream_id` on the stream events and `streamId`
+	// on `on_transcription`. Decoding only the first meant every transcript
+	// arrived claiming stream 0, matched no message, and was discarded --
+	// which is why native transcription looked switched off for as long as
+	// this service has run. Observed 2026-09-10:
+	//   command=on_transcription confidence=0.94 streamId=30319 truncated=false
+	StreamIDCamel uint32  `json:"streamId"`
+	Confidence    float64 `json:"confidence"`
+	From          string  `json:"from"`
+	Text          string  `json:"text"`
+	Truncated     bool    `json:"truncated"`
 }
 
 type stream struct {
@@ -503,7 +516,8 @@ func (c *Client) read(s *session) error {
 				c.cb.Shape("on_transcription", envelopeShape(data))
 			}
 			if c.cb.Transcript != nil {
-				c.cb.Transcript(Transcript{StreamID: e.StreamID, Text: e.Text, Truncated: e.Truncated})
+				c.cb.Transcript(Transcript{StreamID: e.transcriptStream(), Text: e.Text,
+					Confidence: e.Confidence, Truncated: e.Truncated})
 			}
 		case "on_text_message":
 			// Typed messages arrived on the wire and were dropped in silence
@@ -575,4 +589,14 @@ func envelopeShape(data []byte) string {
 		parts = append(parts, fmt.Sprintf("%s=%v", k, raw[k]))
 	}
 	return strings.Join(parts, " ")
+}
+
+// transcriptStream returns the stream a transcript belongs to, from whichever
+// spelling the server used. Preferring the snake_case field keeps the stream
+// events authoritative if Zello ever sends both.
+func (e envelope) transcriptStream() uint32 {
+	if e.StreamID != 0 {
+		return e.StreamID
+	}
+	return e.StreamIDCamel
 }

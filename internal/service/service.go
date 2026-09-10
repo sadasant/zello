@@ -322,11 +322,13 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 				waited, id, watched := watch.done(t.StreamID)
 				switch {
 				case watched:
-					s.log("native: transcript for %s (stream %d) after %s: %d chars, truncated=%v",
-						id, t.StreamID, waited.Round(time.Millisecond), len(text), t.Truncated)
+					s.log("native: transcript for %s (stream %d) after %s: %d chars, confidence=%.2f, truncated=%v",
+						id, t.StreamID, waited.Round(time.Millisecond), len(text), t.Confidence, t.Truncated)
 				default:
-					s.log("native: transcript for unwatched stream %d: %d chars, truncated=%v",
-						t.StreamID, len(text), t.Truncated)
+					// Our own outgoing voice is transcribed too, and has no
+					// incoming message to belong to.
+					s.log("native: transcript for unwatched stream %d: %d chars, confidence=%.2f, truncated=%v",
+						t.StreamID, len(text), t.Confidence, t.Truncated)
 				}
 				if t.Truncated || text == "" {
 					s.log("native: transcript for stream %d discarded (truncated=%v, empty=%v)",
