@@ -1,0 +1,11 @@
+/zello
+/bin/
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.sock
+.DS_Store
