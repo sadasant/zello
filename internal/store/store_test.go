@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"modernc.org/sqlite"
 )
 
 var ctx = context.Background()
@@ -337,5 +340,106 @@ func TestConcurrentConsumersAndSendersAcrossIndependentHandles(t *testing.T) {
 	wg.Wait()
 	if winners != 1 {
 		t.Fatalf("consume winners = %d", winners)
+	}
+}
+
+func TestConcurrentFreshOpenAndEnqueue(t *testing.T) {
+	// A newly selected profile has no database yet. Independent CLI invocations
+	// must all get past connection pragmas/schema creation before enqueueing.
+	for round := 0; round < 8; round++ {
+		path := filepath.Join(t.TempDir(), "messages.db")
+		const producers = 12
+		start := make(chan struct{})
+		type result struct {
+			m   Message
+			err error
+		}
+		results := make(chan result, producers)
+		for i := 0; i < producers; i++ {
+			go func(i int) {
+				<-start
+				s, err := Open(path)
+				if err != nil {
+					results <- result{err: fmt.Errorf("open: %w", err)}
+					return
+				}
+				m, err := s.Enqueue(ctx, fmt.Sprintf("producer-%d", i), "channel")
+				if closeErr := s.Close(); err == nil {
+					err = closeErr
+				}
+				results <- result{m, err}
+			}(i)
+		}
+		close(start)
+		var messages []Message
+		for i := 0; i < producers; i++ {
+			r := <-results
+			if r.err != nil {
+				t.Errorf("round %d producer failed: %v", round, r.err)
+			} else {
+				messages = append(messages, r.m)
+			}
+		}
+		if t.Failed() {
+			return
+		}
+		s := openTest(t, path)
+		var count int
+		if err := s.db.QueryRowContext(ctx, "SELECT count(*) FROM messages WHERE direction='outgoing' AND status='queued'").Scan(&count); err != nil || count != producers {
+			t.Fatalf("round %d durable queue has %d messages, want %d: %v", round, count, producers, err)
+		}
+		for _, m := range messages {
+			got, err := s.Show(ctx, m.ID)
+			if err != nil || got.Text != m.Text || got.Status != "queued" {
+				t.Fatalf("round %d lost an accepted producer's message: %v", round, err)
+			}
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestInitializationDeadlinePreservesBusyError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "messages.db")
+	locker, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	if _, err := locker.Exec("CREATE TABLE lock_holder (id INTEGER); BEGIN EXCLUSIVE"); err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Exec("ROLLBACK")
+	contender, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(0)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer contender.Close()
+	deadline, cancel := context.WithTimeout(ctx, 80*time.Millisecond)
+	defer cancel()
+	err = initialize(deadline, contender)
+	var sqliteErr *sqlite.Error
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &sqliteErr) || sqliteErr.Code()&0xff != 5 {
+		t.Fatalf("deadline did not retain the original SQLite busy error: %v", err)
+	}
+}
+
+func TestInitializationDoesNotRetryNonBusyErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "messages.db")
+	if err := os.WriteFile(path, []byte("this is not a SQLite database"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	deadline, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	err = initialize(deadline, db)
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) || sqliteErr.Code()&0xff == 5 || deadline.Err() != nil {
+		t.Fatalf("non-busy initialization failure was retried or replaced: %v", err)
 	}
 }

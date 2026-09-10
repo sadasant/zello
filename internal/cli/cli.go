@@ -22,8 +22,10 @@ import (
 
 var ErrDisconnected = errors.New("disconnected")
 
-const Usage = `Usage: zello <command> [--json]
+const Usage = `Usage: zello [--profile <name>] <command> [--json]
 
+  profile save <name>   Save credentials privately (use --stdin for JSON)
+  profile list          List saved names without credentials
   service               Maintain the voice connection and process queues
   status                Report connected or disconnected (exit 1 if disconnected)
   count                 Count unread incoming messages ready to read
@@ -35,16 +37,32 @@ const Usage = `Usage: zello <command> [--json]
   send <text>           Queue text for speech; reads stdin if text is omitted
   show <id>             Show durable message state
 
-Configuration: ~/.config/zello/.env
+Default configuration: ~/.config/zello/.env
+Named profiles: ~/.config/zello/profiles/<name>.json
+Processes using the same profile share its queue; different profiles are isolated.
 peek, next, wait, and show produce JSON. Other commands support --json.
 `
 
 func Run(ctx context.Context, args []string, in io.Reader, out, diagnostics io.Writer, p config.Paths) error {
-	if err := config.Prepare(p); err != nil {
+	args, profile, jsonOutput, err := globalOptions(args)
+	if err != nil {
+		return err
+	}
+	if len(args) > 0 && args[0] == "profile" {
+		if profile != "" {
+			return errors.New("profile commands take a name argument, not --profile")
+		}
+		return profiles(ctx, args[1:], jsonOutput, in, out, diagnostics, p)
+	}
+	p, err = config.SelectProfile(p, profile)
+	if err != nil {
 		return err
 	}
 	cfg, err := config.Load(p)
 	if err != nil {
+		return err
+	}
+	if err := config.Prepare(p); err != nil {
 		return err
 	}
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
@@ -52,16 +70,11 @@ func Run(ctx context.Context, args []string, in io.Reader, out, diagnostics io.W
 		return err
 	}
 	command := args[0]
-	jsonOutput := false
 	var positional []string
 	flags := true
 	for _, arg := range args[1:] {
 		if flags && arg == "--" {
 			flags = false
-			continue
-		}
-		if flags && arg == "--json" {
-			jsonOutput = true
 			continue
 		}
 		positional = append(positional, arg)
@@ -188,7 +201,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, diagnostics io.W
 		}
 	case "send":
 		if cfg.Channel == "" {
-			return errors.New("configure ZELLO_CHANNEL in ~/.config/zello/.env")
+			return fmt.Errorf("configure ZELLO_CHANNEL in %s", p.Env)
 		}
 		text := strings.Join(positional, " ")
 		if len(positional) == 0 {
@@ -245,5 +258,115 @@ func readInput(ctx context.Context, in io.Reader) ([]byte, error) {
 			_ = closer.Close()
 		}
 		return nil, ctx.Err()
+	}
+}
+
+// Global options may appear before or after the command. A literal -- ends all
+// option parsing, including for send text that begins with an option name.
+func globalOptions(args []string) (rest []string, profile string, jsonOutput bool, err error) {
+	options, selected := true, false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if options && arg == "--" {
+			options = false
+			rest = append(rest, arg)
+			continue
+		}
+		if options && arg == "--json" {
+			jsonOutput = true
+			continue
+		}
+		if options && (arg == "--profile" || strings.HasPrefix(arg, "--profile=")) {
+			if selected {
+				return nil, "", false, errors.New("--profile may be specified only once")
+			}
+			selected = true
+			if arg == "--profile" {
+				i++
+				if i == len(args) {
+					return nil, "", false, errors.New("--profile requires a name")
+				}
+				profile = args[i]
+			} else {
+				profile = strings.TrimPrefix(arg, "--profile=")
+			}
+			if profile == "" {
+				return nil, "", false, errors.New("--profile requires a name")
+			}
+			continue
+		}
+		rest = append(rest, arg)
+	}
+	return
+}
+
+func profiles(ctx context.Context, args []string, jsonOutput bool, in io.Reader, out, diagnostics io.Writer, base config.Paths) error {
+	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
+		_, err := io.WriteString(out, "Usage: zello profile save <name> [--stdin] [--json]\n       zello profile list [--json]\n\nSave prompts privately on a terminal; --stdin reads a JSON object with .env field names.\nNames are case-insensitive. Existing profiles cannot be overwritten.\n")
+		return err
+	}
+	switch args[0] {
+	case "list":
+		if len(args) != 1 {
+			return errors.New("profile list takes no arguments")
+		}
+		names, err := config.ListProfiles(base)
+		if err != nil {
+			return err
+		}
+		if jsonOutput {
+			return json.NewEncoder(out).Encode(names)
+		}
+		for _, name := range names {
+			if _, err = fmt.Fprintln(out, name); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "save":
+		stdin := false
+		var positional []string
+		for _, arg := range args[1:] {
+			if arg == "--stdin" {
+				stdin = true
+			} else {
+				positional = append(positional, arg)
+			}
+		}
+		if len(positional) != 1 {
+			return errors.New("profile save requires one name and optional --stdin")
+		}
+		name := positional[0]
+		selected, err := config.SelectProfile(base, name)
+		if err != nil {
+			return err
+		}
+		if selected.Profile == "" || selected.Profile == "default" {
+			return errors.New("default is reserved for ~/.config/zello/.env; choose a named profile")
+		}
+		// Avoid asking for credentials for an existing name. SaveProfile still
+		// performs the atomic no-overwrite check when registration races.
+		if _, err := os.Lstat(selected.Env); err == nil {
+			return errors.New("profile already exists; choose a different name")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return errors.New("cannot inspect the profile destination")
+		}
+		cfg, err := readProfileInput(ctx, in, diagnostics, stdin)
+		if err != nil {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err = config.SaveProfile(base, name, cfg); err != nil {
+			return err
+		}
+		if jsonOutput {
+			return json.NewEncoder(out).Encode(map[string]string{"profile": selected.Profile})
+		}
+		_, err = fmt.Fprintln(out, selected.Profile)
+		return err
+	default:
+		return errors.New("unknown profile command; use zello profile help")
 	}
 }

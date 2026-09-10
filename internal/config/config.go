@@ -1,4 +1,4 @@
-// Package config loads the one user-owned configuration file on every invocation.
+// Package config loads the selected user-owned configuration on every invocation.
 package config
 
 import (
@@ -25,11 +25,21 @@ ELEVENLABS_VOICE_ID=
 ELEVENLABS_MODEL_ID=eleven_flash_v2_5
 `
 
-type Paths struct{ Env, Example, Data, DB, Audio, Log, Socket, Lock string }
+type Paths struct {
+	Env, Example, Data, DB, Audio, Log, Socket, Lock string
+	Profile                                          string
+}
 type Config struct {
-	Network, Username, Password, Channel string
-	OpenAIKey, TranscribeModel           string
-	ElevenLabsKey, VoiceID, SpeechModel  string
+	Network         string `json:"ZELLO_NETWORK"`
+	Username        string `json:"ZELLO_USERNAME"`
+	Password        string `json:"ZELLO_PASSWORD"`
+	Channel         string `json:"ZELLO_CHANNEL"`
+	OpenAIKey       string `json:"OPENAI_API_KEY"`
+	TranscribeModel string `json:"OPENAI_TRANSCRIBE_MODEL"`
+	ElevenLabsKey   string `json:"ELEVENLABS_API_KEY"`
+	VoiceID         string `json:"ELEVENLABS_VOICE_ID"`
+	SpeechModel     string `json:"ELEVENLABS_MODEL_ID"`
+	Source          string `json:"-"`
 }
 
 func UserPaths() (Paths, error) {
@@ -42,9 +52,12 @@ func UserPaths() (Paths, error) {
 func PathsAt(home string) Paths {
 	dir := filepath.Join(home, ".local", "share", "zello")
 	cfg := filepath.Join(home, ".config", "zello")
-	return Paths{filepath.Join(cfg, ".env"), filepath.Join(cfg, ".env.example"), dir, filepath.Join(dir, "messages.db"), filepath.Join(dir, "audio"), filepath.Join(dir, "zello.log"), filepath.Join(dir, "zello.sock"), filepath.Join(dir, "service.lock")}
+	return Paths{Env: filepath.Join(cfg, ".env"), Example: filepath.Join(cfg, ".env.example"), Data: dir, DB: filepath.Join(dir, "messages.db"), Audio: filepath.Join(dir, "audio"), Log: filepath.Join(dir, "zello.log"), Socket: filepath.Join(dir, "zello.sock"), Lock: filepath.Join(dir, "service.lock")}
 }
 func Prepare(p Paths) error {
+	if p.Profile != "" && p.Profile != "default" {
+		return prepareProfile(p)
+	}
 	for _, dir := range []string{filepath.Dir(p.Env), p.Data, p.Audio} {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return err
@@ -73,6 +86,9 @@ func Prepare(p Paths) error {
 	return f.Close()
 }
 func Load(p Paths) (Config, error) {
+	if p.Profile != "" && p.Profile != "default" {
+		return loadProfile(p)
+	}
 	values, err := godotenv.Read(p.Env)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return Config{}, fmt.Errorf("cannot parse %s (check .env syntax)", p.Env)
@@ -83,7 +99,7 @@ func Load(p Paths) (Config, error) {
 		}
 		return fallback
 	}
-	c := Config{Network: value("ZELLO_NETWORK", "sadasant"), Username: values["ZELLO_USERNAME"], Password: values["ZELLO_PASSWORD"], Channel: values["ZELLO_CHANNEL"], OpenAIKey: values["OPENAI_API_KEY"], TranscribeModel: value("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"), ElevenLabsKey: values["ELEVENLABS_API_KEY"], VoiceID: values["ELEVENLABS_VOICE_ID"], SpeechModel: value("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")}
+	c := Config{Network: value("ZELLO_NETWORK", "sadasant"), Username: values["ZELLO_USERNAME"], Password: values["ZELLO_PASSWORD"], Channel: values["ZELLO_CHANNEL"], OpenAIKey: values["OPENAI_API_KEY"], TranscribeModel: value("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"), ElevenLabsKey: values["ELEVENLABS_API_KEY"], VoiceID: values["ELEVENLABS_VOICE_ID"], SpeechModel: value("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5"), Source: p.Env}
 	if !regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]*$`).MatchString(c.Network) {
 		return Config{}, errors.New("ZELLO_NETWORK must be a network name")
 	}
@@ -101,7 +117,11 @@ func (c Config) ValidateService() error {
 		missing = append(missing, "ZELLO_CHANNEL")
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("configure %s in ~/.config/zello/.env", strings.Join(missing, ", "))
+		source := c.Source
+		if source == "" {
+			source = "~/.config/zello/.env"
+		}
+		return fmt.Errorf("configure %s in %s", strings.Join(missing, ", "), source)
 	}
 	return nil
 }

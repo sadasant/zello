@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 var ErrNotFound = errors.New("message not found or no longer available")
@@ -80,7 +80,17 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS messages (
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := initialize(ctx, db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db}, nil
+}
+
+func initialize(ctx context.Context, db *sql.DB) error {
+	const schema = `CREATE TABLE IF NOT EXISTS messages (
 		id TEXT PRIMARY KEY,
 		direction TEXT NOT NULL CHECK(direction IN ('incoming','outgoing')),
 		sender TEXT NOT NULL DEFAULT '',
@@ -99,12 +109,31 @@ func Open(path string) (*Store, error) {
 		       (direction='outgoing' AND status IN ('queued','synthesizing','sending','sent','failed')))
 	);
 	CREATE INDEX IF NOT EXISTS messages_queue ON messages(direction,status,created_at,id);
-	CREATE INDEX IF NOT EXISTS messages_transcription ON messages(transcription_status,next_transcription_at);`)
-	if err != nil {
-		db.Close()
-		return nil, err
+	CREATE INDEX IF NOT EXISTS messages_transcription ON messages(transcription_status,next_transcription_at);`
+	var lastBusy error
+	for delay := 10 * time.Millisecond; ; delay = min(2*delay, 200*time.Millisecond) {
+		_, err := db.ExecContext(ctx, schema)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return errors.Join(err, lastBusy, ctx.Err())
+		}
+		var sqliteErr *sqlite.Error
+		if !errors.As(err, &sqliteErr) || sqliteErr.Code()&0xff != 5 { // SQLITE_BUSY, including extended codes.
+			return err
+		}
+		// Initial WAL selection can return BUSY without invoking busy_timeout.
+		// Retry only these idempotent pragmas/schema operations, never queue writes.
+		lastBusy = err
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(lastBusy, ctx.Err())
+		case <-timer.C:
+		}
 	}
-	return &Store{db: db}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }

@@ -1,8 +1,8 @@
 # zello
 
-A small local voice-message service for macOS. One Zello Work network, one channel,
-and one durable SQLite queue. Local processes exchange text and JSON; the service
-handles voice transport, transcription, and speech synthesis.
+A small local voice-message service for macOS. Each profile has one Zello Work
+network, one channel, and one durable SQLite queue. Local processes exchange text
+and JSON; the service handles voice transport, transcription, and speech synthesis.
 
 ```text
 local processes → text → zello service → voice → Zello Work → iPhone
@@ -26,11 +26,11 @@ export PATH="$HOME/.local/bin:$PATH"
 zello count
 ```
 
-Every invocation creates missing private data directories and the configuration
-example, then loads **only `~/.config/zello/.env`**. The working directory's `.env`
-and exported environment variables do not override it. Missing credentials do
-not prevent reading the queue. The service loads configuration at startup;
-restart it after editing credentials or models.
+Without `--profile`, commands use **`~/.config/zello/.env`** and create missing
+private data directories and the configuration example. The working directory's
+`.env` and exported environment variables do not override it. Missing credentials
+do not prevent reading the default queue. The service loads configuration at
+startup; restart it after editing credentials or models.
 
 To create the configuration without overwriting an existing file:
 
@@ -53,10 +53,73 @@ directories are mode 0700; database, audio files, socket, and new log files are
 0600. Treat the stored voice and text as private local data. Neither the real
 configuration nor generated data belongs in Git.
 
+## Saved profiles
+
+Save a named configuration once, then let local processes select it:
+
+```sh
+zello profile save Peter
+zello --profile Peter service
+# In another terminal:
+zello --profile Peter send "Hello Daniel."
+zello --profile Peter wait --json
+zello profile list --json
+```
+
+On a terminal, `profile save` prompts for the Zello account and channel, plus
+optional transcription and speech-provider settings. Password and API-key input
+is hidden. Empty model/network answers use the same defaults as `.env`.
+No credentials are accepted as command-line arguments or printed in results.
+
+Processes can register profiles by passing JSON over stdin:
+
+```sh
+zello profile save Peter --stdin < /path/to/private-profile.json
+```
+
+The JSON object uses the same uppercase setting names as [.env.example](.env.example).
+For example, a minimal profile contains `ZELLO_USERNAME`, `ZELLO_PASSWORD`, and
+`ZELLO_CHANNEL`, each with a string value. Include the OpenAI and ElevenLabs fields
+when needed. Unknown fields, duplicate keys, and invalid configurations fail
+without echoing the submitted values. Saving returns only the canonical profile
+name; `--json` returns `{"profile":"peter"}`.
+
+Names are case-insensitive ASCII letters/digits, `_`, and `-`, beginning with a
+letter or digit, at most 32 characters. `Peter` and `peter` select the same profile.
+`default` selects the original `.env` configuration and is reserved from saving.
+Registration is atomic and create-only: a second save to the same name fails,
+including concurrent saves. To use different credentials, register a new name.
+There is no automatic replacement of a configuration that processes already use.
+
+Named credentials are stored as JSON in
+`~/.config/zello/profiles/peter.json` with mode **0600**, inside private directories.
+These are local files, not an encrypted keychain. The profile contains its own
+complete settings; omitted optional keys do not inherit credentials from `.env`
+or exported environment variables. A missing or invalid named profile fails
+instead of selecting the default account.
+
+Each named profile keeps its database, audio, log, socket, and service lock under
+`~/.local/share/zello/profiles/peter/`. Processes selecting the same name share
+that queue and one service. Different names can run services concurrently, with
+separate queues; a message ID from one profile is unavailable in another. Start
+one `zello --profile NAME service` for each profile you want connected.
+
+`--profile NAME` and `--profile=NAME` work before or after an ordinary command.
+Use `--` when message text itself resembles an option:
+
+```sh
+zello --profile Peter send -- "--profile"
+```
+
+Profile-management commands take their name as an argument, without `--profile`.
+The existing commands and data paths remain the default when no profile is selected.
+
 ## Commands
 
 | Command | Result |
 | --- | --- |
+| `zello profile save <name> [--stdin] [--json]` | Register credentials privately; existing names are not overwritten |
+| `zello profile list [--json]` | List profile names, including the built-in `default`, without credentials |
 | `zello service` | Runs until Ctrl-C or SIGTERM; diagnostics on stderr and in the log |
 | `zello status [--json]` | `connected` or `disconnected`; JSON also reports whether the service is running and whether it has used native transcription |
 | `zello count [--json]` | Number of unread incoming messages ready to read |
@@ -89,7 +152,7 @@ pipe after consumption does not restore the message automatically.
 
 SQLite in WAL mode is the durable shared state. A private Unix socket supplies
 live health, outgoing wakeups, and incoming notifications. A file lock allows
-only one service. There is no listening TCP port. If the service is absent,
+only one service per profile. There is no listening TCP port. If the service is absent,
 `wait` checks SQLite every 500 ms; while it is running, socket waits block and
 are refreshed at most every 30 seconds.
 
@@ -136,6 +199,9 @@ a new ID. Changing the configured channel does not redirect previously queued
 messages: a channel mismatch fails explicitly.
 
 ## Local files
+
+These paths describe the default profile. Named profiles use the configuration
+and data directories described above.
 
 | Path | Purpose |
 | --- | --- |
