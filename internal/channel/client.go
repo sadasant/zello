@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,6 +58,8 @@ type Callbacks struct {
 	Transcript func(Transcript)
 	Text       func(TextMessage)
 	State      func(bool)
+	// Shape reports an event's wire fields for diagnosis. Temporary.
+	Shape func(command, fields string)
 }
 
 // SendError identifies an ambiguous transmission. Started is true if starting
@@ -488,6 +491,17 @@ func (c *Client) read(s *session) error {
 		case "on_error":
 			return errors.New("Zello server reported an error")
 		case "on_transcription":
+			// Temporary, 2026-09-10. The service matches a transcript to its
+			// message by stream_id, and every transcript observed so far has
+			// arrived with stream_id 0 while the audio stream it belongs to had
+			// a real id -- so the lookup never matches and the transcript is
+			// filed under a key nothing claims. Which field actually carries the
+			// identifier is the question; this reports the envelope's shape,
+			// with the transcript text itself replaced by its length so a
+			// diagnostic does not copy what Daniel said into a second place.
+			if c.cb.Shape != nil {
+				c.cb.Shape("on_transcription", envelopeShape(data))
+			}
 			if c.cb.Transcript != nil {
 				c.cb.Transcript(Transcript{StreamID: e.StreamID, Text: e.Text, Truncated: e.Truncated})
 			}
@@ -538,4 +552,27 @@ func (c *Client) deliverText(e envelope) {
 		return
 	}
 	c.cb.Text(TextMessage{Sender: e.From, Channel: e.Channel, Text: text})
+}
+
+// envelopeShape renders an event's fields for a log line, replacing any text
+// with its length. Temporary, and paired with the on_transcription diagnostic.
+func envelopeShape(data []byte) string {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return "unparsable"
+	}
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if s, ok := raw[k].(string); ok && (k == "text" || len(s) > 40) {
+			parts = append(parts, fmt.Sprintf("%s=<%d chars>", k, len(s)))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=%v", k, raw[k]))
+	}
+	return strings.Join(parts, " ")
 }

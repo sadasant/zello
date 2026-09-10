@@ -311,6 +311,9 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 				s.complete(durable, id, tm.Text, false, fail)
 				s.signal(s.incoming)
 			},
+			Shape: func(command, fields string) {
+				s.log("native: %s envelope: %s", command, fields)
+			},
 			Transcript: func(t channel.Transcript) {
 				text := strings.TrimSpace(t.Text)
 				// Logged before anything is decided. The truncated case used to
