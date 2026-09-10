@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,9 +44,18 @@ type Transcript struct {
 	Text      string
 	Truncated bool
 }
+
+// TextMessage is a message someone typed rather than spoke. Zello delivers it
+// as a single event with no stream behind it, so there is no audio to save and
+// nothing to transcribe: the text has already arrived.
+type TextMessage struct {
+	Sender, Channel, Text string
+}
+
 type Callbacks struct {
 	Audio      func(Incoming)
 	Transcript func(Transcript)
+	Text       func(TextMessage)
 	State      func(bool)
 }
 
@@ -481,6 +491,12 @@ func (c *Client) read(s *session) error {
 			if c.cb.Transcript != nil {
 				c.cb.Transcript(Transcript{StreamID: e.StreamID, Text: e.Text, Truncated: e.Truncated})
 			}
+		case "on_text_message":
+			// Typed messages arrived on the wire and were dropped in silence
+			// until 2026-09-10: this switch handled five commands and let the
+			// rest fall through without a word, so a message sent from a phone
+			// looked delivered at one end and never existed at the other.
+			c.deliverText(e)
 		case "on_stream_start":
 			if e.Type != "audio" || e.Channel != c.cfg.Channel {
 				continue
@@ -507,4 +523,19 @@ func (c *Client) read(s *session) error {
 			complete(e.StreamID, nil)
 		}
 	}
+}
+
+// deliverText hands a typed Zello message to the callback, if it belongs to this
+// channel and carries anything. The read loop calls it and so do the tests --
+// one implementation, because two copies of a rule are how the two answers
+// start to differ.
+func (c *Client) deliverText(e envelope) {
+	if e.Channel != c.cfg.Channel {
+		return
+	}
+	text := strings.TrimSpace(e.Text)
+	if text == "" || c.cb.Text == nil {
+		return
+	}
+	c.cb.Text(TextMessage{Sender: e.From, Channel: e.Channel, Text: text})
 }

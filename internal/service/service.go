@@ -190,6 +190,28 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 				}
 				s.signal(s.incoming)
 			},
+			Text: func(tm channel.TextMessage) {
+				// A typed message is already text. It skips the audio file, the
+				// three-second wait for a native transcript and the OpenAI
+				// fallback entirely, and is readable the moment it lands.
+				durable, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				id, err := store.NewID()
+				if err != nil {
+					fail(errors.New("cannot allocate incoming message ID"))
+					return
+				}
+				m := store.Message{ID: id, Sender: tm.Sender, Channel: tm.Channel}
+				if err = s.Store.SaveIncoming(durable, m); err != nil {
+					fail(errors.New("cannot persist incoming text message"))
+					return
+				}
+				s.log("incoming %s saved (text)", id)
+				// native=false: nothing was transcribed, so this must not be
+				// evidence that native transcription works.
+				s.complete(durable, id, tm.Text, false, fail)
+				s.signal(s.incoming)
+			},
 			Transcript: func(t channel.Transcript) {
 				text := strings.TrimSpace(t.Text)
 				if t.Truncated || text == "" {
