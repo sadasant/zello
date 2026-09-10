@@ -36,6 +36,65 @@ func incoming(t *testing.T, s *Store, id string, at time.Time, done bool) {
 	}
 }
 
+func TestTextIncomingCommittedReadyAndSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "messages.db")
+	s := openTest(t, path)
+	m := Message{
+		ID: "typed", Sender: "person", Channel: "channel", ReplyTo: "previous",
+		Text: "  First line\nSecond line.\n", CreatedAt: time.Now().UTC(),
+	}
+	if err := s.SaveTextIncoming(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Reopen before any follow-up completion: the first committed state must
+	// already contain the original text and be available to a CLI consumer.
+	s = openTest(t, path)
+	if err := s.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Peek(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != m.ID || got.Text != m.Text || got.Sender != m.Sender || got.Channel != m.Channel || got.ReplyTo != m.ReplyTo || !got.CreatedAt.Equal(m.CreatedAt) {
+		t.Fatalf("typed content or metadata changed: %+v", got)
+	}
+	if got.Direction != "incoming" || got.Status != "unread" || got.TranscriptionStatus != "done" || got.AudioPath != "" || got.TranscriptionAttempts != 0 || !got.NextTranscriptionAt.IsZero() {
+		t.Fatalf("typed message requires an audio completion step: %+v", got)
+	}
+	if n, err := s.Count(ctx); err != nil || n != 1 {
+		t.Fatalf("typed message not immediately readable: %d, %v", n, err)
+	}
+	if pending, err := s.PendingIncoming(ctx); err != nil || len(pending) != 0 {
+		t.Fatalf("typed message created an audio job: %+v, %v", pending, err)
+	}
+	if err := s.SaveTextIncoming(ctx, Message{ID: m.ID, Channel: m.Channel, Text: "duplicate body"}); err == nil {
+		t.Fatal("duplicate ID overwrote the original text")
+	}
+	if err := s.CompleteIncoming(ctx, m.ID, "late transcription"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("typed body could be overwritten by transcription: %v", err)
+	}
+	got, err = s.Next(ctx)
+	if err != nil || got.Text != m.Text || got.Status != "consumed" {
+		t.Fatalf("typed message was not consumed intact: %+v, %v", got, err)
+	}
+}
+
+func TestTextIncomingRejectsEmptyMessagesWithoutLeavingRows(t *testing.T) {
+	s := openTest(t, filepath.Join(t.TempDir(), "messages.db"))
+	for _, m := range []Message{{ID: "empty"}, {ID: "whitespace", Text: " \t\n "}, {Text: "missing ID"}} {
+		if err := s.SaveTextIncoming(ctx, m); err == nil {
+			t.Fatalf("accepted invalid text message %+v", m)
+		}
+		if _, err := s.Show(ctx, m.ID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("invalid message left a durable row: %v", err)
+		}
+	}
+}
+
 func TestInboxWaitsForTranscriptionAndConsumptionIsFinal(t *testing.T) {
 	s := openTest(t, filepath.Join(t.TempDir(), "messages.db"))
 	now := time.Now().UTC()

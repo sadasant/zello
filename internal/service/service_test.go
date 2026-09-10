@@ -53,6 +53,8 @@ func (f *speechFake) Synthesize(ctx context.Context, text, path string) error {
 }
 
 type transportEvent struct {
+	text       *channel.TextMessage
+	done       chan struct{}
 	audio      *channel.Incoming
 	transcript *channel.Transcript
 }
@@ -84,6 +86,12 @@ func (f *transportFake) Run(ctx context.Context) error {
 			}
 			if e.transcript != nil {
 				f.cb.Transcript(*e.transcript)
+			}
+			if e.text != nil {
+				f.cb.Text(*e.text)
+			}
+			if e.done != nil {
+				close(e.done)
 			}
 		}
 	}
@@ -633,61 +641,196 @@ func TestNativeWatchStopsWaitingOnceTheTranscriptArrives(t *testing.T) {
 	}
 }
 
-// A transcript of someone else's voice arrives with no stream id at all --
-// Zello sends `streamId` only for our own outgoing transmissions. Matching is
-// therefore positional, and must refuse to guess when the position is ambiguous.
-func TestIdentifierlessTranscriptMatchesTheOneMessageWaiting(t *testing.T) {
-	w := newNativeWatch()
-	if _, _, waiting := w.claim(); waiting != 0 {
-		t.Fatal("claimed a transcript with nothing waiting")
-	}
-	w.add(22370, "message-a")
-	id, waited, waiting := w.claim()
-	if waiting != 1 || id != "message-a" || waited < 0 {
-		t.Fatalf("the one waiting message was not matched: id=%q waiting=%d", id, waiting)
-	}
-	if _, _, waiting = w.claim(); waiting != 0 {
-		t.Fatal("the message was matched twice")
+// deliver waits until the service has handled the entire callback, allowing
+// negative assertions without races against the fake transport's event queue.
+func deliver(t *testing.T, tr *transportFake, event transportEvent) {
+	t.Helper()
+	event.done = make(chan struct{})
+	tr.events <- event
+	select {
+	case <-event.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("service callback did not finish")
 	}
 }
 
-func TestIdentifierlessTranscriptRefusesToGuessBetweenTwo(t *testing.T) {
-	w := newNativeWatch()
-	w.add(1, "message-a")
-	w.add(2, "message-b")
-	id, _, waiting := w.claim()
-	if waiting != 2 || id != "" {
-		t.Fatalf("a transcript was attached to one of two candidates: id=%q waiting=%d", id, waiting)
-	}
-	if still, _ := w.overdue(); len(still) != 2 {
-		t.Fatalf("an ambiguous claim consumed a message: %v", still)
+func TestIdentifierlessNativeAlwaysUsesFullAudioFallback(t *testing.T) {
+	for _, order := range []string{"before audio", "after audio"} {
+		t.Run(order, func(t *testing.T) {
+			f := makeFixture(t)
+			sink := &logSink{}
+			f.logger = log.New(sink, "", 0)
+			s, tr, _ := startFixture(t, f, 10*time.Millisecond, nil)
+			transcript := &channel.Transcript{Text: "private-unattributed-text"}
+			if order == "before audio" {
+				deliver(t, tr, transportEvent{transcript: transcript})
+			}
+			deliver(t, tr, transportEvent{audio: &f.voice})
+			if order == "after audio" {
+				deliver(t, tr, transportEvent{transcript: transcript})
+			}
+			unread(t, f, "fallback transcription")
+			if s.native.Load() || f.speech.transcriptions.Load() != 1 {
+				t.Fatal("identifierless text bypassed full-audio fallback")
+			}
+			if strings.Contains(sink.String(), transcript.Text) {
+				t.Fatal("unattributed transcript text leaked into diagnostics")
+			}
+			if !strings.Contains(sink.String(), "without a stream ID ignored") {
+				t.Fatal("missing identifierless event diagnostic")
+			}
+		})
 	}
 }
 
-// A transcript can overtake its own audio. It is held for the next stream, and
-// only for a while -- an identifier-less transcript that waits too long would
-// otherwise attach itself to an unrelated message.
-func TestHeldTranscriptIsClaimedByTheNextStreamAndExpires(t *testing.T) {
-	w := newNativeWatch()
-	w.hold("spoken first")
-	if got := w.add(99, "message-a"); got != "spoken first" {
-		t.Fatalf("the next stream did not claim the held transcript: %q", got)
+func TestSecondActiveStreamsIdentifierlessTranscriptCannotCompleteTheFirst(t *testing.T) {
+	f := makeFixture(t)
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	f.speech.transcribe = func(ctx context.Context, path string) (string, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-release:
+				return "first full audio", nil
+			}
+		}
+		return "second full audio", nil
 	}
-	if got := w.add(100, "message-b"); got != "" {
-		t.Fatalf("a held transcript was claimed twice: %q", got)
+	s, tr, _ := startFixture(t, f, 10*time.Millisecond, nil)
+	first, second := f.voice, f.voice
+	first.Sender = "first-speaker"
+	second.StreamID = 43
+	second.Sender = "second-speaker"
+	deliver(t, tr, transportEvent{audio: &first})
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first fallback did not start")
 	}
+	// B is still active: channel.Audio is emitted only when that stream stops.
+	// Its native text overtakes B's stop while A remains pending.
+	deliver(t, tr, transportEvent{transcript: &channel.Transcript{Text: "second native text"}})
+	if n, err := f.db.Count(context.Background()); err != nil || n != 0 {
+		t.Fatal("second stream's text completed the first message")
+	}
+	deliver(t, tr, transportEvent{audio: &second})
+	releaseOnce.Do(func() { close(release) })
+	eventually(t, func() bool { n, err := f.db.Count(context.Background()); return err == nil && n == 2 })
+	messages, err := f.db.Inbox(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messages[0].Sender != "first-speaker" || messages[0].Text != "first full audio" || messages[1].Sender != "second-speaker" || messages[1].Text != "second full audio" {
+		t.Fatal("text was attributed to the wrong audio")
+	}
+	if s.native.Load() || f.speech.transcriptions.Load() != 2 {
+		t.Fatal("native event replaced one of the full-audio transcripts")
+	}
+}
 
-	w2 := newNativeWatch()
-	w2.hold("stale")
-	w2.heldSince = time.Now().Add(-2 * nativeHoldFor)
-	if got := w2.add(1, "message-c"); got != "" {
-		t.Fatalf("a stale transcript was attached to an unrelated message: %q", got)
+func TestRejectedAudioLateIdentifierlessTranscriptCannotAttachToNextAudio(t *testing.T) {
+	f := makeFixture(t)
+	s, tr, _ := startFixture(t, f, 10*time.Millisecond, nil)
+	rejected, valid := f.voice, f.voice
+	rejected.Header = []byte{1, 2, 3}
+	valid.StreamID = 43
+	valid.Sender = "next-speaker"
+	deliver(t, tr, transportEvent{audio: &rejected})
+	deliver(t, tr, transportEvent{transcript: &channel.Transcript{Text: "words from rejected audio"}})
+	deliver(t, tr, transportEvent{audio: &valid})
+	m := unread(t, f, "fallback transcription")
+	if m.Sender != "next-speaker" || s.native.Load() || f.speech.transcriptions.Load() != 1 {
+		t.Fatal("rejected audio's late text affected the next message")
 	}
+}
 
-	w3 := newNativeWatch()
-	w3.add(1, "message-d")
-	w3.hold("arrived while one was already waiting")
-	if got := w3.add(2, "message-e"); got != "" {
-		t.Fatal("a held transcript was claimed while another message was already waiting")
+func TestNativeCompletionForgetsEveryCorrelationRecord(t *testing.T) {
+	watch := newNativeWatch()
+	received := map[uint32]string{42: "complete-message", 43: "pending-message"}
+	early := map[uint32]string{42: "early native text", 44: "other early native text"}
+	watch.add(42, "complete-message")
+	watch.add(43, "pending-message")
+	forgetNative(42, received, early, watch)
+	if _, ok := received[42]; ok {
+		t.Fatal("completed stream remains addressable")
+	}
+	if _, ok := early[42]; ok {
+		t.Fatal("completed early transcript remains buffered")
+	}
+	still, gaveUp := watch.overdue()
+	if len(still) != 1 || !strings.Contains(still[0], "pending-message") || len(gaveUp) != 0 {
+		t.Fatal("completed stream remains in native diagnostics")
+	}
+	if received[43] != "pending-message" || early[44] != "other early native text" {
+		t.Fatal("cleanup affected another stream")
+	}
+}
+
+func TestEarlyKeyedNativeClearsTheReceivedEntry(t *testing.T) {
+	f := makeFixture(t)
+	sink := &logSink{}
+	f.logger = log.New(sink, "", 0)
+	_, tr, _ := startFixture(t, f, time.Second, nil)
+	transcript := &channel.Transcript{StreamID: 42, Text: "keyed native text"}
+	deliver(t, tr, transportEvent{transcript: transcript})
+	deliver(t, tr, transportEvent{audio: &f.voice})
+	m := unread(t, f, transcript.Text)
+	if err := f.db.Consume(context.Background(), m.ID); err != nil {
+		t.Fatal(err)
+	}
+	// A duplicate now has no pending received entry, just as when it arrives
+	// after the ordinary audio-first completion path.
+	deliver(t, tr, transportEvent{transcript: transcript})
+	if strings.Count(sink.String(), "stream 42 with no message yet") != 2 {
+		t.Fatal("early keyed completion left the received entry behind")
+	}
+	latest, err := f.db.Show(context.Background(), m.ID)
+	if err != nil || latest.Status != "consumed" || latest.Text != transcript.Text {
+		t.Fatal("duplicate keyed transcript changed consumed text")
+	}
+}
+
+func TestTypedMessageIsImmediatelyDurableAndReadableAfterRestart(t *testing.T) {
+	f := makeFixture(t)
+	s, tr, stop := startFixture(t, f, time.Hour, nil)
+	typed := &channel.TextMessage{Sender: "typist", Channel: "test-channel", Text: "A complete typed message."}
+	deliver(t, tr, transportEvent{text: typed})
+	m, err := f.db.Peek(context.Background())
+	if err != nil || m.Text != typed.Text || m.Sender != typed.Sender || m.AudioPath != "" || m.TranscriptionStatus != "done" {
+		t.Fatal("typed message was not immediately complete")
+	}
+	if s.native.Load() || f.speech.transcriptions.Load() != 0 || f.speech.syntheses.Load() != 0 {
+		t.Fatal("typed text invoked speech or changed native transcription status")
+	}
+	stop()
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.db, err = store.Open(f.paths.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.db.Close() })
+	restarted, _, stopAgain := startFixture(t, f, 10*time.Millisecond, nil)
+	got, err := f.db.Peek(context.Background())
+	if err != nil || got.ID != m.ID || got.Text != typed.Text || got.TranscriptionStatus != "done" {
+		t.Fatal("typed message was lost across restart")
+	}
+	pending, err := f.db.PendingIncoming(context.Background())
+	if err != nil || len(pending) != 0 {
+		t.Fatal("typed message was scheduled for transcription")
+	}
+	got, err = f.db.Next(context.Background())
+	if err != nil || got.ID != m.ID || got.Status != "consumed" {
+		t.Fatal("restarted typed message could not be consumed")
+	}
+	stopAgain()
+	if restarted.native.Load() || f.speech.transcriptions.Load() != 0 || f.speech.syntheses.Load() != 0 {
+		t.Fatal("restart sent typed text through speech providers")
 	}
 }

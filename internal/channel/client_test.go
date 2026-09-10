@@ -421,3 +421,49 @@ func TestTranscriptCarriesConfidence(t *testing.T) {
 		t.Fatalf("confidence not decoded: %v", e.Confidence)
 	}
 }
+
+func TestEnvelopeShapeKeepsOnlyUsefulTypedMetadata(t *testing.T) {
+	input := `{"command":"on_transcription","stream_id":12,"streamId":34,"confidence":0.9456,"truncated":false,"text":"hello"}`
+	want := "stream_id=12 streamId=34 confidence=0.9456 truncated=false text=<5 bytes>"
+	if got := envelopeShape([]byte(input)); got != want {
+		t.Fatalf("diagnostic metadata=%q, want %q", got, want)
+	}
+}
+
+func TestEnvelopeShapeOmitsNestedAndUnexpectedContent(t *testing.T) {
+	input := `{
+		"command":"on_transcription",
+		"text":"private speech",
+		"translations":[{"language":"es","message":"private translated speech"}],
+		"sender":"private sender",
+		"short":"secret",
+		"extra":{"text":"nested secret","values":["another secret"]},
+		"private field\ninjected log line":"do not render the field name either"
+	}`
+	if got := envelopeShape([]byte(input)); got != "text=<14 bytes>" {
+		t.Fatalf("diagnostic exposed more than text length: %q", got)
+	}
+	if got := envelopeShape([]byte(`{"private field\ninjected":"secret","translations":[{"message":"private speech"}]}`)); got != "<no diagnostic metadata>" {
+		t.Fatalf("unknown fields were rendered: %q", got)
+	}
+}
+
+func TestEnvelopeShapeRejectsUnexpectedTypesAndRanges(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{`{"stream_id":"secret","streamId":{"message":"nested secret"},"confidence":["private"],"truncated":"secret","text":{"message":"private speech"}}`,
+			"stream_id=<invalid> streamId=<invalid> confidence=<invalid> truncated=<invalid> text=<invalid>"},
+		{`{"stream_id":-1,"streamId":4294967296,"confidence":2,"truncated":null,"text":null}`,
+			"stream_id=<invalid> streamId=<invalid> confidence=<invalid> truncated=<invalid> text=<invalid>"},
+		{`{"stream_id":1.5,"streamId":true,"confidence":-0.1,"truncated":1,"text":["private speech"]}`,
+			"stream_id=<invalid> streamId=<invalid> confidence=<invalid> truncated=<invalid> text=<invalid>"},
+		{`{"stream_id":null,"confidence":"0.94"}`, "stream_id=<invalid> confidence=<invalid>"},
+		{`{"stream_id":0,"streamId":4294967295,"confidence":1,"truncated":true,"text":""}`,
+			"stream_id=0 streamId=4294967295 confidence=1 truncated=true text=<0 bytes>"},
+		{`{"text":"private speech"`, "unparsable"},
+	}
+	for _, tc := range cases {
+		if got := envelopeShape([]byte(tc.input)); got != tc.want {
+			t.Errorf("diagnostic=%q, want %q", got, tc.want)
+		}
+	}
+}

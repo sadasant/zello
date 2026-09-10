@@ -26,7 +26,7 @@ const Usage = `Usage: zello <command> [--json]
 
   service               Maintain the voice connection and process queues
   status                Report connected or disconnected (exit 1 if disconnected)
-  count                 Count unread, transcribed incoming messages
+  count                 Count unread incoming messages ready to read
   inbox                 List unread messages
   peek                  Show oldest unread message without consuming it
   consume <id>          Atomically consume an unread message

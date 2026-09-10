@@ -183,6 +183,25 @@ func (s *Store) SaveIncoming(ctx context.Context, m Message) error {
 	return err
 }
 
+// SaveTextIncoming commits a typed message and its readable state together.
+// Unlike audio, there is no original file from which to recover a missing body.
+func (s *Store) SaveTextIncoming(ctx context.Context, m Message) error {
+	if m.ID == "" {
+		return errors.New("incoming message ID must not be empty")
+	}
+	if strings.TrimSpace(m.Text) == "" {
+		return errors.New("message text must not be empty")
+	}
+	if m.CreatedAt.IsZero() {
+		m.CreatedAt = time.Now()
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO messages
+		(id,direction,sender,channel,text,status,reply_to,created_at,transcription_status)
+		VALUES (?,'incoming',?,?,?,'unread',?,?,'done')`,
+		m.ID, m.Sender, m.Channel, m.Text, m.ReplyTo, m.CreatedAt.UnixNano())
+	return err
+}
+
 // CompleteIncoming accepts the first successful transcription only. In particular,
 // a late native transcript cannot replace text already handed to a consumer.
 func (s *Store) CompleteIncoming(ctx context.Context, id, text string) error {

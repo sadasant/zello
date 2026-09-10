@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -568,25 +567,43 @@ func (c *Client) deliverText(e envelope) {
 	c.cb.Text(TextMessage{Sender: e.From, Channel: e.Channel, Text: text})
 }
 
-// envelopeShape renders an event's fields for a log line, replacing any text
-// with its length. Temporary, and paired with the on_transcription diagnostic.
+// envelopeShape logs only fixed diagnostic fields with their expected types.
+// Unknown names and values (including nested translations) may contain message
+// content, so none of them are rendered. Text itself is represented by byte count.
 func envelopeShape(data []byte) string {
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return "unparsable"
 	}
-	keys := make([]string, 0, len(raw))
-	for k := range raw {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		if s, ok := raw[k].(string); ok && (k == "text" || len(s) > 40) {
-			parts = append(parts, fmt.Sprintf("%s=<%d chars>", k, len(s)))
+	var parts []string
+	for _, key := range []string{"stream_id", "streamId", "confidence", "truncated", "text"} {
+		value, present := raw[key]
+		if !present {
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("%s=%v", k, raw[k]))
+		safe := "<invalid>"
+		switch key {
+		case "stream_id", "streamId":
+			if n, ok := value.(float64); ok && n >= 0 && n <= 1<<32-1 && n == float64(uint32(n)) {
+				safe = fmt.Sprintf("%d", uint32(n))
+			}
+		case "confidence":
+			if n, ok := value.(float64); ok && n >= 0 && n <= 1 {
+				safe = fmt.Sprintf("%g", n)
+			}
+		case "truncated":
+			if b, ok := value.(bool); ok {
+				safe = fmt.Sprintf("%t", b)
+			}
+		case "text":
+			if text, ok := value.(string); ok {
+				safe = fmt.Sprintf("<%d bytes>", len(text))
+			}
+		}
+		parts = append(parts, key+"="+safe)
+	}
+	if len(parts) == 0 {
+		return "<no diagnostic metadata>"
 	}
 	return strings.Join(parts, " ")
 }

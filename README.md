@@ -44,7 +44,8 @@ Use the fields in [.env.example](.env.example). Set the Zello **Work username,
 password, and channel**. The account must be able to join and speak in that channel.
 The default network is `sadasant`, using `wss://zellowork.io/ws/sadasant`.
 ElevenLabs needs an API key and voice ID for outgoing speech. Configure an OpenAI
-key for incoming transcription when native transcription is unavailable.
+key for incoming transcription when native transcription is unavailable or its
+events omit a stream ID.
 
 Credentials are never included in application logs or provider error messages.
 Provider response bodies are not used as diagnostics. Configuration and data
@@ -58,7 +59,7 @@ configuration nor generated data belongs in Git.
 | --- | --- |
 | `zello service` | Runs until Ctrl-C or SIGTERM; diagnostics on stderr and in the log |
 | `zello status [--json]` | `connected` or `disconnected`; JSON also reports whether the service is running and whether it has used native transcription |
-| `zello count [--json]` | Number of unread, transcribed incoming messages |
+| `zello count [--json]` | Number of unread incoming messages ready to read |
 | `zello inbox [--json]` | Readable unread messages, or a JSON array |
 | `zello peek [--json]` | Oldest unread message as JSON, without consuming it |
 | `zello consume <id> [--json]` | Atomically consumes that unread incoming message; prints its ID |
@@ -97,19 +98,28 @@ failures reconnect with jittered backoff from roughly 1 to 30 seconds. Sending
 starts only after successful authentication and an online channel notification.
 
 Incoming audio is preserved before transcription. The service requests native
-transcriptions and accepts a complete, nonempty event for the corresponding
-incoming stream. It waits up to three seconds after audio completion for that
-event, then uses OpenAI audio transcription with `gpt-4o-mini-transcribe` (or the
-configured model). A partial native event is never treated as a complete message.
+transcriptions and accepts a complete, nonempty event whose `stream_id` or
+`streamId` identifies the corresponding incoming stream. Events without a usable
+stream ID are logged as uncorrelated and use the saved-audio fallback; arrival
+order does not establish which message was transcribed. The service waits up to
+three seconds after audio completion for an identified native event, then uses
+OpenAI audio transcription with `gpt-4o-mini-transcribe` (or the configured model).
+A partial native event is never treated as a complete message.
 The first completed transcript wins, so late events cannot rewrite consumed text.
 No chat or completion API is involved.
 
 A pending transcription stays durable but is excluded from the unread inbox
 until text is ready. Failed transcription attempts retry with backoff up to five
 minutes, including after restart. A missing OpenAI key leaves the audio pending
-unless a native transcript arrives. IDs and deferred errors are recorded in the
-log and can be inspected with `show`. Broken/incomplete received streams are
+unless a native transcript with a matching stream ID arrives. IDs and deferred
+errors are recorded in the log and can be inspected with `show`.
+Broken/incomplete received streams are
 retained with an error and withheld from normal consumption.
+
+Typed Zello messages are stored with their text and ready state in one database
+transaction. They appear in the same unread inbox immediately, survive restart,
+and need neither audio nor transcription. Native diagnostics log only selected
+metadata and text lengths; nested translations and unknown values are omitted.
 
 Outgoing state progresses through `queued → synthesizing → sending → sent`.
 Ordinary ElevenLabs HTTP TTS uses the configured voice and `eleven_flash_v2_5` by

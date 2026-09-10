@@ -130,22 +130,9 @@ func (s *Service) Run(parent context.Context) error {
 	return err
 }
 
-// nativeWatch is a temporary diagnostic, added 2026-09-10 at Daniel's request
-// and meant to be removed once it has answered its question.
-//
-// Zello shows Daniel a transcript for every message he sends, and this service
-// has never recorded receiving one: `native_transcription_observed` has been
-// false for every voice message the floor has taken. Both facts cannot be the
-// whole story, so something about the shape of `on_transcription` -- whether it
-// arrives at all on this socket, how late, and whether it is flagged truncated
-// -- is unknown, and the code was arranged so that it stayed unknown. The
-// truncated branch below returned in silence.
-//
-// This changes no behaviour. It observes: every native transcript is logged the
-// moment it arrives, whatever its shape, and a stream still waiting for one is
-// reported every `nativeWatchEvery` until `nativeWatchFor` expires. It has its
-// own lock because the ticker runs on its own goroutine, while the callbacks
-// run on the client's read loop.
+// Native diagnostics track whether a keyed transcript arrives for a completed
+// audio stream. They never assign text by arrival order: an identifierless event
+// cannot establish which original audio it describes.
 const (
 	nativeWatchEvery = 30 * time.Second
 	nativeWatchFor   = 15 * time.Minute
@@ -160,38 +147,14 @@ type nativeWatch struct {
 	mu sync.Mutex
 	// waiting holds incoming streams whose transcript has not arrived.
 	waiting map[uint32]nativeWait
-	// held is a transcript that arrived before any stream was waiting for it.
-	// The next incoming stream claims it, if it appears soon enough -- an
-	// identifier-less transcript can only be matched by position, so a stale one
-	// must expire rather than attach itself to an unrelated message.
-	held      string
-	heldSince time.Time
 }
-
-const nativeHoldFor = 10 * time.Second
 
 func newNativeWatch() *nativeWatch { return &nativeWatch{waiting: map[uint32]nativeWait{}} }
 
-// add registers a stream as awaiting a transcript, and returns one already
-// held if this stream is the only candidate for it.
-func (w *nativeWatch) add(stream uint32, id string) string {
+func (w *nativeWatch) add(stream uint32, id string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.held != "" && len(w.waiting) == 0 && time.Since(w.heldSince) < nativeHoldFor {
-		text := w.held
-		w.held, w.heldSince = "", time.Time{}
-		return text
-	}
-	w.held, w.heldSince = "", time.Time{}
 	w.waiting[stream] = nativeWait{id: id, since: time.Now()}
-	return ""
-}
-
-// hold keeps a transcript that arrived before its audio did.
-func (w *nativeWatch) hold(text string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.held, w.heldSince = text, time.Now()
 }
 
 // done reports how long the stream waited, and whether it was being watched at
@@ -208,28 +171,12 @@ func (w *nativeWatch) done(stream uint32) (time.Duration, string, bool) {
 	return time.Since(entry.since), entry.id, true
 }
 
-// claim attributes a transcript that carries no stream id at all.
-//
-// Zello sends `streamId` only on transcripts of our own outgoing transmissions.
-// A transcript of someone else's voice arrives with the field absent entirely
-// -- observed 2026-09-10, `language=en-US` present and no identifier of any
-// kind -- so there is nothing to match on and correlation has to be positional.
-//
-// The rule refuses to guess. Exactly one stream waiting is the ordinary case on
-// a half-duplex channel and is attributed; more than one is ambiguous and is
-// reported rather than assigned, because attaching the wrong words to the wrong
-// message is worse than transcribing it ourselves.
-func (w *nativeWatch) claim() (id string, waited time.Duration, waiting int) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if len(w.waiting) != 1 {
-		return "", 0, len(w.waiting)
-	}
-	for stream, entry := range w.waiting {
-		delete(w.waiting, stream)
-		return entry.id, time.Since(entry.since), 1
-	}
-	return "", 0, 0
+// Forget every correlation record together when a keyed transcript is handled.
+// Both before-audio and after-audio arrival paths use this cleanup.
+func forgetNative(stream uint32, received, early map[uint32]string, watch *nativeWatch) {
+	delete(received, stream)
+	delete(early, stream)
+	watch.done(stream)
 }
 
 // overdue returns the streams still waiting, and drops those past the window so
@@ -331,12 +278,10 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 					clear(received)
 				}
 				received[in.StreamID] = id
-				if text := watch.add(in.StreamID, id); text != "" {
-					s.log("native: transcript that arrived before its audio claimed by %s", id)
+				watch.add(in.StreamID, id)
+				if text, ok := early[in.StreamID]; ok {
 					s.complete(durable, id, text, true, fail)
-				} else if text, ok := early[in.StreamID]; ok {
-					delete(early, in.StreamID)
-					s.complete(durable, id, text, true, fail)
+					forgetNative(in.StreamID, received, early, watch)
 				}
 				s.signal(s.incoming)
 			},
@@ -351,15 +296,15 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 					fail(errors.New("cannot allocate incoming message ID"))
 					return
 				}
-				m := store.Message{ID: id, Sender: tm.Sender, Channel: tm.Channel}
-				if err = s.Store.SaveIncoming(durable, m); err != nil {
+				m := store.Message{ID: id, Sender: tm.Sender, Channel: tm.Channel, Text: tm.Text}
+				if err = s.Store.SaveTextIncoming(durable, m); err != nil {
 					fail(errors.New("cannot persist incoming text message"))
 					return
 				}
 				s.log("incoming %s saved (text)", id)
-				// native=false: nothing was transcribed, so this must not be
-				// evidence that native transcription works.
-				s.complete(durable, id, tm.Text, false, fail)
+				// The row is already complete in its first durable transaction.
+				// Typed text is not evidence that native transcription works.
+				s.socket.Notify()
 				s.signal(s.incoming)
 			},
 			Shape: func(command, fields string) {
@@ -372,48 +317,28 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 						t.StreamID, t.Truncated, text == "")
 					return
 				}
-				// A transcript carrying a stream id is one of our own outgoing
-				// transmissions coming back; it belongs to no incoming message.
-				// One with no id at all is a transcript of someone speaking to
-				// us, and is matched by position.
-				if t.StreamID != 0 {
-					if id, ok := received[t.StreamID]; ok {
-						s.log("native: transcript for %s (stream %d): %d chars, confidence=%.2f",
-							id, t.StreamID, len(text), t.Confidence)
-						s.complete(ctx, id, text, true, fail)
-						delete(received, t.StreamID)
-						watch.done(t.StreamID)
-						return
-					}
-					// Either one of our own outgoing transmissions, which no
-					// incoming message will ever claim, or a transcript that
-					// overtook its audio. Held under its id: the first is never
-					// claimed and ages out with the map, the second is claimed
-					// the moment the audio lands.
-					s.log("native: transcript for stream %d with no message yet: %d chars, confidence=%.2f",
-						t.StreamID, len(text), t.Confidence)
-					if len(early) >= 4096 {
-						clear(early)
-					}
-					early[t.StreamID] = text
+				if t.StreamID == 0 {
+					// Even a sole waiting message is not proof of identity: this
+					// could be another active stream, a duplicate, or a late event.
+					s.log("native: transcript without a stream ID ignored; using full-audio fallback")
 					return
 				}
-				id, waited, waiting := watch.claim()
-				if waiting == 0 {
-					// Its audio has not been stored yet. Held for the next one.
-					s.log("native: transcript with no stream id arrived before any audio: holding (%d chars, confidence=%.2f)",
-						len(text), t.Confidence)
-					watch.hold(text)
+				if id, ok := received[t.StreamID]; ok {
+					s.log("native: transcript for %s (stream %d): %d chars, confidence=%.2f",
+						id, t.StreamID, len(text), t.Confidence)
+					s.complete(ctx, id, text, true, fail)
+					forgetNative(t.StreamID, received, early, watch)
 					return
 				}
-				if waiting != 1 {
-					s.log("native: transcript with no stream id and %d messages waiting: not attributed (%d chars, confidence=%.2f)",
-						waiting, len(text), t.Confidence)
-					return
+				// Keep a keyed early transcript only for audio with that exact ID.
+				// Outgoing echoes without a corresponding incoming stream are
+				// never assigned to another message.
+				s.log("native: transcript for stream %d with no message yet: %d chars, confidence=%.2f",
+					t.StreamID, len(text), t.Confidence)
+				if len(early) >= 4096 {
+					clear(early)
 				}
-				s.log("native: transcript for %s after %s: %d chars, confidence=%.2f",
-					id, waited.Round(time.Millisecond), len(text), t.Confidence)
-				s.complete(ctx, id, text, true, fail)
+				early[t.StreamID] = text
 			},
 		}
 		client := s.NewTransport(cb)
