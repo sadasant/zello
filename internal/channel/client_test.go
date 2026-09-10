@@ -346,3 +346,78 @@ func TestClientCanRunAgainAfterDisconnect(t *testing.T) {
 		}
 	}
 }
+
+// A typed Zello message must reach the callback. These arrived on the wire and
+// were dropped in silence until 2026-09-10, because the switch handled five
+// commands and let the rest fall through without a word.
+func TestOnTextMessageReachesTheCallback(t *testing.T) {
+	cases := []struct {
+		name, channel, from, text string
+		configured                string
+		want                      string
+	}{
+		{name: "delivered", channel: "agents", from: "admin", text: "hello there", configured: "agents", want: "hello there"},
+		{name: "trimmed", channel: "agents", from: "admin", text: "  spaced  ", configured: "agents", want: "spaced"},
+		{name: "other channel ignored", channel: "elsewhere", from: "admin", text: "not mine", configured: "agents", want: ""},
+		{name: "empty ignored", channel: "agents", from: "admin", text: "   ", configured: "agents", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got TextMessage
+			c := &Client{cfg: Config{Channel: tc.configured}, cb: Callbacks{
+				Text: func(m TextMessage) { got = m },
+			}}
+			e := envelope{Command: "on_text_message", Channel: tc.channel, From: tc.from, Text: tc.text}
+			c.deliverText(e)
+			if got.Text != tc.want {
+				t.Fatalf("text = %q, want %q", got.Text, tc.want)
+			}
+			if tc.want != "" && got.Sender != tc.from {
+				t.Fatalf("sender = %q, want %q", got.Sender, tc.from)
+			}
+		})
+	}
+}
+
+// A nil callback must not panic: the transport is shared, and a caller that
+// does not want text messages should simply not receive them.
+func TestOnTextMessageWithNoCallbackIsSafe(t *testing.T) {
+	c := &Client{cfg: Config{Channel: "agents"}}
+	c.deliverText(envelope{Command: "on_text_message", Channel: "agents", Text: "hi"})
+}
+
+// Zello spells the field `streamId` on on_transcription and `stream_id` on the
+// stream events. Decoding only the second meant every transcript claimed stream
+// 0, matched no message, and was silently discarded.
+func TestTranscriptStreamAcceptsEitherSpelling(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		raw  string
+		want uint32
+	}{
+		{"camelCase, as on_transcription sends it", `{"command":"on_transcription","streamId":30319}`, 30319},
+		{"snake_case stays authoritative", `{"command":"on_transcription","stream_id":22370}`, 22370},
+		{"snake_case wins when both are present", `{"command":"on_transcription","stream_id":1,"streamId":2}`, 1},
+		{"neither present is still zero", `{"command":"on_transcription"}`, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var e envelope
+			if err := json.Unmarshal([]byte(c.raw), &e); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got := e.transcriptStream(); got != c.want {
+				t.Fatalf("stream id: got %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func TestTranscriptCarriesConfidence(t *testing.T) {
+	var e envelope
+	if err := json.Unmarshal([]byte(`{"command":"on_transcription","streamId":7,"confidence":0.9456}`), &e); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if e.Confidence < 0.94 || e.Confidence > 0.95 {
+		t.Fatalf("confidence not decoded: %v", e.Confidence)
+	}
+}

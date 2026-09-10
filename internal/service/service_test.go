@@ -1,14 +1,17 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -98,6 +101,28 @@ type fixture struct {
 	db     *store.Store
 	speech *speechFake
 	voice  channel.Incoming
+	// Set before startFixture to capture what the service logs. Nil leaves
+	// logging off, which is what every test that does not read it wants.
+	logger *log.Logger
+}
+
+// logSink collects log output from the callbacks and the native-watch ticker,
+// which write from different goroutines.
+type logSink struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *logSink) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *logSink) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
 }
 
 func makeFixture(t *testing.T) *fixture {
@@ -150,7 +175,7 @@ func makeFixture(t *testing.T) *fixture {
 func startFixture(t *testing.T, f *fixture, grace time.Duration, send func(context.Context) error) (*Service, *transportFake, func()) {
 	t.Helper()
 	transport := &transportFake{ready: make(chan struct{}), events: make(chan transportEvent, 8), sent: make(chan channel.Incoming, 8), send: send}
-	s := &Service{Config: config.Config{Network: "test", Username: "service", Password: "fixture-password", Channel: "test-channel"}, Paths: f.paths, Store: f.db, Speech: f.speech, NativeGrace: grace, NewTransport: func(cb channel.Callbacks) Transport { transport.cb = cb; return transport }}
+	s := &Service{Config: config.Config{Network: "test", Username: "service", Password: "fixture-password", Channel: "test-channel"}, Paths: f.paths, Store: f.db, Speech: f.speech, Logger: f.logger, NativeGrace: grace, NewTransport: func(cb channel.Callbacks) Transport { transport.cb = cb; return transport }}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { result <- s.Run(ctx) }()
@@ -556,5 +581,113 @@ func TestAutomaticReconnectResumesQueuedMessage(t *testing.T) {
 	}
 	if f.speech.syntheses.Load() != 1 {
 		t.Fatal("reconnect unnecessarily synthesized the queued message again")
+	}
+}
+
+// A truncated native transcript used to return in silence, which is why "Zello
+// never sends one" and "Zello always sends a truncated one" could not be told
+// apart from the outside. It is now logged. The behaviour it logs about is
+// unchanged: the audio fallback still produces the text, and a truncated
+// transcript is still not evidence that native transcription works.
+func TestTruncatedNativeIsLoggedRatherThanDroppedInSilence(t *testing.T) {
+	f := makeFixture(t)
+	sink := &logSink{}
+	f.logger = log.New(sink, "", 0)
+	s, tr, _ := startFixture(t, f, 10*time.Millisecond, nil)
+	tr.events <- transportEvent{audio: &f.voice}
+	unread(t, f, "fallback transcription")
+	tr.events <- transportEvent{transcript: &channel.Transcript{StreamID: 42, Text: "incomplete text", Truncated: true}}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for !strings.Contains(sink.String(), "discarded") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	logged := sink.String()
+	for _, want := range []string{"native: transcript for", "truncated=true", "discarded"} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("truncated native transcript was not reported: wanted %q in:\n%s", want, logged)
+		}
+	}
+	if s.native.Load() {
+		t.Fatal("a truncated transcript was counted as evidence that native transcription works")
+	}
+}
+
+// The watch must forget a stream once its transcript arrives, or the ticker
+// would report a message that is no longer waiting for anything.
+func TestNativeWatchStopsWaitingOnceTheTranscriptArrives(t *testing.T) {
+	w := newNativeWatch()
+	w.add(42, "message-id")
+	waited, id, watched := w.done(42)
+	if !watched || id != "message-id" || waited < 0 {
+		t.Fatalf("watched stream was not reported: watched=%v id=%q waited=%v", watched, id, waited)
+	}
+	if still, gaveUp := w.overdue(); len(still) != 0 || len(gaveUp) != 0 {
+		t.Fatalf("stream still watched after its transcript arrived: still=%v gaveUp=%v", still, gaveUp)
+	}
+	if _, _, watched = w.done(42); watched {
+		t.Fatal("a stream was reported watched twice")
+	}
+	if _, _, watched = w.done(99); watched {
+		t.Fatal("a transcript for a stream that was never watched was reported as watched")
+	}
+}
+
+// A transcript of someone else's voice arrives with no stream id at all --
+// Zello sends `streamId` only for our own outgoing transmissions. Matching is
+// therefore positional, and must refuse to guess when the position is ambiguous.
+func TestIdentifierlessTranscriptMatchesTheOneMessageWaiting(t *testing.T) {
+	w := newNativeWatch()
+	if _, _, waiting := w.claim(); waiting != 0 {
+		t.Fatal("claimed a transcript with nothing waiting")
+	}
+	w.add(22370, "message-a")
+	id, waited, waiting := w.claim()
+	if waiting != 1 || id != "message-a" || waited < 0 {
+		t.Fatalf("the one waiting message was not matched: id=%q waiting=%d", id, waiting)
+	}
+	if _, _, waiting = w.claim(); waiting != 0 {
+		t.Fatal("the message was matched twice")
+	}
+}
+
+func TestIdentifierlessTranscriptRefusesToGuessBetweenTwo(t *testing.T) {
+	w := newNativeWatch()
+	w.add(1, "message-a")
+	w.add(2, "message-b")
+	id, _, waiting := w.claim()
+	if waiting != 2 || id != "" {
+		t.Fatalf("a transcript was attached to one of two candidates: id=%q waiting=%d", id, waiting)
+	}
+	if still, _ := w.overdue(); len(still) != 2 {
+		t.Fatalf("an ambiguous claim consumed a message: %v", still)
+	}
+}
+
+// A transcript can overtake its own audio. It is held for the next stream, and
+// only for a while -- an identifier-less transcript that waits too long would
+// otherwise attach itself to an unrelated message.
+func TestHeldTranscriptIsClaimedByTheNextStreamAndExpires(t *testing.T) {
+	w := newNativeWatch()
+	w.hold("spoken first")
+	if got := w.add(99, "message-a"); got != "spoken first" {
+		t.Fatalf("the next stream did not claim the held transcript: %q", got)
+	}
+	if got := w.add(100, "message-b"); got != "" {
+		t.Fatalf("a held transcript was claimed twice: %q", got)
+	}
+
+	w2 := newNativeWatch()
+	w2.hold("stale")
+	w2.heldSince = time.Now().Add(-2 * nativeHoldFor)
+	if got := w2.add(1, "message-c"); got != "" {
+		t.Fatalf("a stale transcript was attached to an unrelated message: %q", got)
+	}
+
+	w3 := newNativeWatch()
+	w3.add(1, "message-d")
+	w3.hold("arrived while one was already waiting")
+	if got := w3.add(2, "message-e"); got != "" {
+		t.Fatal("a held transcript was claimed while another message was already waiting")
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,14 +41,30 @@ type Incoming struct {
 }
 
 type Transcript struct {
-	StreamID  uint32
-	Text      string
-	Truncated bool
+	StreamID uint32
+	Text     string
+	// Confidence is Zello's own, between 0 and 1. It is the only measure of
+	// audio quality either end of this hotline has, and the question that
+	// produced this field was whether a sentence that does not parse was
+	// misheard or meant.
+	Confidence float64
+	Truncated  bool
 }
+
+// TextMessage is a message someone typed rather than spoke. Zello delivers it
+// as a single event with no stream behind it, so there is no audio to save and
+// nothing to transcribe: the text has already arrived.
+type TextMessage struct {
+	Sender, Channel, Text string
+}
+
 type Callbacks struct {
 	Audio      func(Incoming)
 	Transcript func(Transcript)
+	Text       func(TextMessage)
 	State      func(bool)
+	// Shape reports an event's wire fields for diagnosis. Temporary.
+	Shape func(command, fields string)
 }
 
 // SendError identifies an ambiguous transmission. Started is true if starting
@@ -94,9 +112,17 @@ type envelope struct {
 	CodecHeader    string  `json:"codec_header"`
 	PacketDuration float64 `json:"packet_duration"`
 	StreamID       uint32  `json:"stream_id"`
-	From           string  `json:"from"`
-	Text           string  `json:"text"`
-	Truncated      bool    `json:"truncated"`
+	// Zello names this field `stream_id` on the stream events and `streamId`
+	// on `on_transcription`. Decoding only the first meant every transcript
+	// arrived claiming stream 0, matched no message, and was discarded --
+	// which is why native transcription looked switched off for as long as
+	// this service has run. Observed 2026-09-10:
+	//   command=on_transcription confidence=0.94 streamId=30319 truncated=false
+	StreamIDCamel uint32  `json:"streamId"`
+	Confidence    float64 `json:"confidence"`
+	From          string  `json:"from"`
+	Text          string  `json:"text"`
+	Truncated     bool    `json:"truncated"`
 }
 
 type stream struct {
@@ -478,9 +504,27 @@ func (c *Client) read(s *session) error {
 		case "on_error":
 			return errors.New("Zello server reported an error")
 		case "on_transcription":
-			if c.cb.Transcript != nil {
-				c.cb.Transcript(Transcript{StreamID: e.StreamID, Text: e.Text, Truncated: e.Truncated})
+			// Temporary, 2026-09-10. The service matches a transcript to its
+			// message by stream_id, and every transcript observed so far has
+			// arrived with stream_id 0 while the audio stream it belongs to had
+			// a real id -- so the lookup never matches and the transcript is
+			// filed under a key nothing claims. Which field actually carries the
+			// identifier is the question; this reports the envelope's shape,
+			// with the transcript text itself replaced by its length so a
+			// diagnostic does not copy what Daniel said into a second place.
+			if c.cb.Shape != nil {
+				c.cb.Shape("on_transcription", envelopeShape(data))
 			}
+			if c.cb.Transcript != nil {
+				c.cb.Transcript(Transcript{StreamID: e.transcriptStream(), Text: e.Text,
+					Confidence: e.Confidence, Truncated: e.Truncated})
+			}
+		case "on_text_message":
+			// Typed messages arrived on the wire and were dropped in silence
+			// until 2026-09-10: this switch handled five commands and let the
+			// rest fall through without a word, so a message sent from a phone
+			// looked delivered at one end and never existed at the other.
+			c.deliverText(e)
 		case "on_stream_start":
 			if e.Type != "audio" || e.Channel != c.cfg.Channel {
 				continue
@@ -507,4 +551,52 @@ func (c *Client) read(s *session) error {
 			complete(e.StreamID, nil)
 		}
 	}
+}
+
+// deliverText hands a typed Zello message to the callback, if it belongs to this
+// channel and carries anything. The read loop calls it and so do the tests --
+// one implementation, because two copies of a rule are how the two answers
+// start to differ.
+func (c *Client) deliverText(e envelope) {
+	if e.Channel != c.cfg.Channel {
+		return
+	}
+	text := strings.TrimSpace(e.Text)
+	if text == "" || c.cb.Text == nil {
+		return
+	}
+	c.cb.Text(TextMessage{Sender: e.From, Channel: e.Channel, Text: text})
+}
+
+// envelopeShape renders an event's fields for a log line, replacing any text
+// with its length. Temporary, and paired with the on_transcription diagnostic.
+func envelopeShape(data []byte) string {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return "unparsable"
+	}
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if s, ok := raw[k].(string); ok && (k == "text" || len(s) > 40) {
+			parts = append(parts, fmt.Sprintf("%s=<%d chars>", k, len(s)))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=%v", k, raw[k]))
+	}
+	return strings.Join(parts, " ")
+}
+
+// transcriptStream returns the stream a transcript belongs to, from whichever
+// spelling the server used. Preferring the snake_case field keeps the stream
+// events authoritative if Zello ever sends both.
+func (e envelope) transcriptStream() uint32 {
+	if e.StreamID != 0 {
+		return e.StreamID
+	}
+	return e.StreamIDCamel
 }
