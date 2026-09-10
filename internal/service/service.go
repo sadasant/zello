@@ -157,16 +157,41 @@ type nativeWait struct {
 }
 
 type nativeWatch struct {
-	mu      sync.Mutex
+	mu sync.Mutex
+	// waiting holds incoming streams whose transcript has not arrived.
 	waiting map[uint32]nativeWait
+	// held is a transcript that arrived before any stream was waiting for it.
+	// The next incoming stream claims it, if it appears soon enough -- an
+	// identifier-less transcript can only be matched by position, so a stale one
+	// must expire rather than attach itself to an unrelated message.
+	held      string
+	heldSince time.Time
 }
+
+const nativeHoldFor = 10 * time.Second
 
 func newNativeWatch() *nativeWatch { return &nativeWatch{waiting: map[uint32]nativeWait{}} }
 
-func (w *nativeWatch) add(stream uint32, id string) {
+// add registers a stream as awaiting a transcript, and returns one already
+// held if this stream is the only candidate for it.
+func (w *nativeWatch) add(stream uint32, id string) string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.held != "" && len(w.waiting) == 0 && time.Since(w.heldSince) < nativeHoldFor {
+		text := w.held
+		w.held, w.heldSince = "", time.Time{}
+		return text
+	}
+	w.held, w.heldSince = "", time.Time{}
 	w.waiting[stream] = nativeWait{id: id, since: time.Now()}
+	return ""
+}
+
+// hold keeps a transcript that arrived before its audio did.
+func (w *nativeWatch) hold(text string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.held, w.heldSince = text, time.Now()
 }
 
 // done reports how long the stream waited, and whether it was being watched at
@@ -181,6 +206,30 @@ func (w *nativeWatch) done(stream uint32) (time.Duration, string, bool) {
 	}
 	delete(w.waiting, stream)
 	return time.Since(entry.since), entry.id, true
+}
+
+// claim attributes a transcript that carries no stream id at all.
+//
+// Zello sends `streamId` only on transcripts of our own outgoing transmissions.
+// A transcript of someone else's voice arrives with the field absent entirely
+// -- observed 2026-09-10, `language=en-US` present and no identifier of any
+// kind -- so there is nothing to match on and correlation has to be positional.
+//
+// The rule refuses to guess. Exactly one stream waiting is the ordinary case on
+// a half-duplex channel and is attributed; more than one is ambiguous and is
+// reported rather than assigned, because attaching the wrong words to the wrong
+// message is worse than transcribing it ourselves.
+func (w *nativeWatch) claim() (id string, waited time.Duration, waiting int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.waiting) != 1 {
+		return "", 0, len(w.waiting)
+	}
+	for stream, entry := range w.waiting {
+		delete(w.waiting, stream)
+		return entry.id, time.Since(entry.since), 1
+	}
+	return "", 0, 0
 }
 
 // overdue returns the streams still waiting, and drops those past the window so
@@ -282,8 +331,10 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 					clear(received)
 				}
 				received[in.StreamID] = id
-				watch.add(in.StreamID, id)
-				if text, ok := early[in.StreamID]; ok {
+				if text := watch.add(in.StreamID, id); text != "" {
+					s.log("native: transcript that arrived before its audio claimed by %s", id)
+					s.complete(durable, id, text, true, fail)
+				} else if text, ok := early[in.StreamID]; ok {
 					delete(early, in.StreamID)
 					s.complete(durable, id, text, true, fail)
 				}
@@ -316,34 +367,53 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 			},
 			Transcript: func(t channel.Transcript) {
 				text := strings.TrimSpace(t.Text)
-				// Logged before anything is decided. The truncated case used to
-				// return here in silence, which is why "Zello never sends one"
-				// and "Zello always sends a truncated one" looked identical.
-				waited, id, watched := watch.done(t.StreamID)
-				switch {
-				case watched:
-					s.log("native: transcript for %s (stream %d) after %s: %d chars, confidence=%.2f, truncated=%v",
-						id, t.StreamID, waited.Round(time.Millisecond), len(text), t.Confidence, t.Truncated)
-				default:
-					// Our own outgoing voice is transcribed too, and has no
-					// incoming message to belong to.
-					s.log("native: transcript for unwatched stream %d: %d chars, confidence=%.2f, truncated=%v",
-						t.StreamID, len(text), t.Confidence, t.Truncated)
-				}
 				if t.Truncated || text == "" {
 					s.log("native: transcript for stream %d discarded (truncated=%v, empty=%v)",
 						t.StreamID, t.Truncated, text == "")
 					return
 				}
-				if id, ok := received[t.StreamID]; ok {
-					s.complete(ctx, id, text, true, fail)
-					delete(received, t.StreamID)
-				} else {
+				// A transcript carrying a stream id is one of our own outgoing
+				// transmissions coming back; it belongs to no incoming message.
+				// One with no id at all is a transcript of someone speaking to
+				// us, and is matched by position.
+				if t.StreamID != 0 {
+					if id, ok := received[t.StreamID]; ok {
+						s.log("native: transcript for %s (stream %d): %d chars, confidence=%.2f",
+							id, t.StreamID, len(text), t.Confidence)
+						s.complete(ctx, id, text, true, fail)
+						delete(received, t.StreamID)
+						watch.done(t.StreamID)
+						return
+					}
+					// Either one of our own outgoing transmissions, which no
+					// incoming message will ever claim, or a transcript that
+					// overtook its audio. Held under its id: the first is never
+					// claimed and ages out with the map, the second is claimed
+					// the moment the audio lands.
+					s.log("native: transcript for stream %d with no message yet: %d chars, confidence=%.2f",
+						t.StreamID, len(text), t.Confidence)
 					if len(early) >= 4096 {
 						clear(early)
 					}
 					early[t.StreamID] = text
+					return
 				}
+				id, waited, waiting := watch.claim()
+				if waiting == 0 {
+					// Its audio has not been stored yet. Held for the next one.
+					s.log("native: transcript with no stream id arrived before any audio: holding (%d chars, confidence=%.2f)",
+						len(text), t.Confidence)
+					watch.hold(text)
+					return
+				}
+				if waiting != 1 {
+					s.log("native: transcript with no stream id and %d messages waiting: not attributed (%d chars, confidence=%.2f)",
+						waiting, len(text), t.Confidence)
+					return
+				}
+				s.log("native: transcript for %s after %s: %d chars, confidence=%.2f",
+					id, waited.Round(time.Millisecond), len(text), t.Confidence)
+				s.complete(ctx, id, text, true, fail)
 			},
 		}
 		client := s.NewTransport(cb)

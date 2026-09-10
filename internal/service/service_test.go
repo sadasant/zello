@@ -632,3 +632,62 @@ func TestNativeWatchStopsWaitingOnceTheTranscriptArrives(t *testing.T) {
 		t.Fatal("a transcript for a stream that was never watched was reported as watched")
 	}
 }
+
+// A transcript of someone else's voice arrives with no stream id at all --
+// Zello sends `streamId` only for our own outgoing transmissions. Matching is
+// therefore positional, and must refuse to guess when the position is ambiguous.
+func TestIdentifierlessTranscriptMatchesTheOneMessageWaiting(t *testing.T) {
+	w := newNativeWatch()
+	if _, _, waiting := w.claim(); waiting != 0 {
+		t.Fatal("claimed a transcript with nothing waiting")
+	}
+	w.add(22370, "message-a")
+	id, waited, waiting := w.claim()
+	if waiting != 1 || id != "message-a" || waited < 0 {
+		t.Fatalf("the one waiting message was not matched: id=%q waiting=%d", id, waiting)
+	}
+	if _, _, waiting = w.claim(); waiting != 0 {
+		t.Fatal("the message was matched twice")
+	}
+}
+
+func TestIdentifierlessTranscriptRefusesToGuessBetweenTwo(t *testing.T) {
+	w := newNativeWatch()
+	w.add(1, "message-a")
+	w.add(2, "message-b")
+	id, _, waiting := w.claim()
+	if waiting != 2 || id != "" {
+		t.Fatalf("a transcript was attached to one of two candidates: id=%q waiting=%d", id, waiting)
+	}
+	if still, _ := w.overdue(); len(still) != 2 {
+		t.Fatalf("an ambiguous claim consumed a message: %v", still)
+	}
+}
+
+// A transcript can overtake its own audio. It is held for the next stream, and
+// only for a while -- an identifier-less transcript that waits too long would
+// otherwise attach itself to an unrelated message.
+func TestHeldTranscriptIsClaimedByTheNextStreamAndExpires(t *testing.T) {
+	w := newNativeWatch()
+	w.hold("spoken first")
+	if got := w.add(99, "message-a"); got != "spoken first" {
+		t.Fatalf("the next stream did not claim the held transcript: %q", got)
+	}
+	if got := w.add(100, "message-b"); got != "" {
+		t.Fatalf("a held transcript was claimed twice: %q", got)
+	}
+
+	w2 := newNativeWatch()
+	w2.hold("stale")
+	w2.heldSince = time.Now().Add(-2 * nativeHoldFor)
+	if got := w2.add(1, "message-c"); got != "" {
+		t.Fatalf("a stale transcript was attached to an unrelated message: %q", got)
+	}
+
+	w3 := newNativeWatch()
+	w3.add(1, "message-d")
+	w3.hold("arrived while one was already waiting")
+	if got := w3.add(2, "message-e"); got != "" {
+		t.Fatal("a held transcript was claimed while another message was already waiting")
+	}
+}
