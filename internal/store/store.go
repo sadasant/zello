@@ -294,6 +294,25 @@ func (s *Store) Inbox(ctx context.Context) ([]Message, error) {
 	return s.list(ctx, `SELECT `+columns+` FROM messages WHERE `+unread+` ORDER BY created_at,id`)
 }
 
+// InboxIDs is the same readable snapshot as Inbox without loading private text
+// or audio metadata into notification payloads.
+func (s *Store) InboxIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM messages WHERE `+unread+` ORDER BY created_at,id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (s *Store) Peek(ctx context.Context) (Message, error) {
 	return scan(s.db.QueryRowContext(ctx, `SELECT `+columns+` FROM messages WHERE `+unread+` ORDER BY created_at,id LIMIT 1`))
 }

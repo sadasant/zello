@@ -38,6 +38,7 @@ type Server struct {
 	// not call Close synchronously from a request handler.
 	State  func() Status
 	Unread func(context.Context) (bool, error)
+	Inbox  func(context.Context) ([]string, error)
 	Wake   func()
 }
 
@@ -170,6 +171,8 @@ func (s *Server) handle(ctx context.Context, c net.Conn) {
 		return
 	}
 	switch req.Op {
+	case "subscribe":
+		s.subscribe(ctx, c)
 	case "status":
 		if s.State != nil {
 			_ = json.NewEncoder(c).Encode(s.State())

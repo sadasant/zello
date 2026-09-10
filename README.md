@@ -128,6 +128,7 @@ The existing commands and data paths remain the default when no profile is selec
 | `zello consume <id> [--json]` | Atomically consumes that unread incoming message; prints its ID |
 | `zello next [--json]` | Atomically consumes and prints the oldest unread message as JSON |
 | `zello wait [--json]` | Blocks, then atomically consumes and prints one message as JSON |
+| `zello subscribe [--json]` | Streams unread-ID snapshots over a persistent connection; never consumes |
 | `zello send "text" [--json]` | Durably enqueues outgoing text and immediately returns its ID |
 | `echo "text" \| zello send` | Same enqueue behavior, reading stdin |
 | `zello show <id> [--json]` | Durable message state as JSON |
@@ -147,6 +148,27 @@ Multiple consumers can wait concurrently; each incoming message is consumed
 once. Use `peek` plus `consume` when processing must succeed before consumption.
 `next` and `wait` consume before printing, so a consumer crash or broken output
 pipe after consumption does not restore the message automatically.
+
+### Event subscriptions
+
+`zello subscribe --json` prints newline-delimited JSON: an initial snapshot of
+readable unread IDs, then another snapshot when the service makes incoming text
+available. Each line has the form `{"type":"inbox","ids":["message-id"]}`;
+an empty snapshot has `"ids":[]`. Transcripts and audio paths are not included.
+Use `show <id>` to read and `consume <id>` after processing succeeds.
+
+The connection blocks indefinitely while idle. There is no timer, heartbeat,
+database polling, or message consumption in the subscription. Every subscriber
+gets its own snapshots; these are advisory, not exclusive claims. Concurrent
+consumers can consume an ID before you read it. Consumption alone does not emit
+a notification. Deduplicate IDs durably if you forward notifications elsewhere.
+
+The service must be running. A disconnection exits nonzero; callers should
+reconnect with backoff on failure. Each new connection takes a fresh snapshot,
+including unread messages received during downtime. Slow readers may be
+disconnected after a blocked write. This keeps reconnect/recovery explicit while
+ordinary idle connections stay open. The existing consuming `wait` command keeps
+its short-polling fallback for use when the service is unavailable.
 
 ## Service behavior
 

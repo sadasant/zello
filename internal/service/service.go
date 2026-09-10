@@ -99,6 +99,7 @@ func (s *Service) Run(parent context.Context) error {
 	socket.State = s.status
 	socket.Wake = func() { s.signal(s.outgoing) }
 	socket.Unread = func(ctx context.Context) (bool, error) { n, err := s.Store.Count(ctx); return n > 0, err }
+	socket.Inbox = s.Store.InboxIDs
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	faults := make(chan error, 1)

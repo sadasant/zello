@@ -834,3 +834,45 @@ func TestTypedMessageIsImmediatelyDurableAndReadableAfterRestart(t *testing.T) {
 		t.Fatal("restart sent typed text through speech providers")
 	}
 }
+
+func TestSubscriptionNotifiesAfterVoiceTranscriptionWithoutConsuming(t *testing.T) {
+	f := makeFixture(t)
+	_, tr, _ := startFixture(t, f, time.Millisecond, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan ipc.Event, 8)
+	done := make(chan error, 1)
+	go func() {
+		done <- ipc.Subscribe(ctx, f.paths.Socket, func(event ipc.Event) error {
+			events <- event
+			return nil
+		})
+	}()
+	next := func() ipc.Event {
+		select {
+		case event := <-events:
+			return event
+		case <-time.After(5 * time.Second):
+			t.Fatal("subscription did not notify")
+			return ipc.Event{}
+		}
+	}
+	if event := next(); len(event.IDs) != 0 {
+		t.Fatal("initial snapshot was not empty")
+	}
+	deliver(t, tr, transportEvent{audio: &f.voice})
+	event := next()
+	m, err := f.db.Peek(ctx)
+	if err != nil || len(event.IDs) != 1 || event.IDs[0] != m.ID || m.TranscriptionStatus != "done" || m.Status != "unread" {
+		t.Fatalf("notification did not reference durable unread transcription: %+v, %v", event, err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscription did not cancel")
+	}
+}

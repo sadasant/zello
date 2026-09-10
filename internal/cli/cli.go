@@ -34,13 +34,14 @@ const Usage = `Usage: zello [--profile <name>] <command> [--json]
   consume <id>          Atomically consume an unread message
   next                  Atomically consume and show oldest unread message
   wait                  Wait, then atomically consume and show a message
+  subscribe             Stream unread-ID notifications without consuming
   send <text>           Queue text for speech; reads stdin if text is omitted
   show <id>             Show durable message state
 
 Default configuration: ~/.config/zello/.env
 Named profiles: ~/.config/zello/profiles/<name>.json
 Processes using the same profile share its queue; different profiles are isolated.
-peek, next, wait, and show produce JSON. Other commands support --json.
+peek, next, wait, show, and subscribe produce JSON. Other commands support --json.
 `
 
 func Run(ctx context.Context, args []string, in io.Reader, out, diagnostics io.Writer, p config.Paths) error {
@@ -85,7 +86,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, diagnostics io.W
 		want = 1
 	case "send":
 		want = -1
-	case "service", "status", "count", "inbox", "peek", "next", "wait":
+	case "service", "status", "count", "inbox", "peek", "next", "wait", "subscribe":
 	default:
 		return fmt.Errorf("unknown command %q; use zello help", command)
 	}
@@ -100,6 +101,8 @@ func Run(ctx context.Context, args []string, in io.Reader, out, diagnostics io.W
 	encode := func(v any) error { return json.NewEncoder(out).Encode(v) }
 	printMessage := func(m store.Message) error { m.AudioPath = ""; return encode(m) }
 	switch command {
+	case "subscribe":
+		return ipc.Subscribe(ctx, p.Socket, func(event ipc.Event) error { return encode(event) })
 	case "service":
 		f, err := os.OpenFile(p.Log, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
 		if err != nil {
