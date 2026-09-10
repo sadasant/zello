@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -128,12 +130,108 @@ func (s *Service) Run(parent context.Context) error {
 	return err
 }
 
+// nativeWatch is a temporary diagnostic, added 2026-09-10 at Daniel's request
+// and meant to be removed once it has answered its question.
+//
+// Zello shows Daniel a transcript for every message he sends, and this service
+// has never recorded receiving one: `native_transcription_observed` has been
+// false for every voice message the floor has taken. Both facts cannot be the
+// whole story, so something about the shape of `on_transcription` -- whether it
+// arrives at all on this socket, how late, and whether it is flagged truncated
+// -- is unknown, and the code was arranged so that it stayed unknown. The
+// truncated branch below returned in silence.
+//
+// This changes no behaviour. It observes: every native transcript is logged the
+// moment it arrives, whatever its shape, and a stream still waiting for one is
+// reported every `nativeWatchEvery` until `nativeWatchFor` expires. It has its
+// own lock because the ticker runs on its own goroutine, while the callbacks
+// run on the client's read loop.
+const (
+	nativeWatchEvery = 30 * time.Second
+	nativeWatchFor   = 15 * time.Minute
+)
+
+type nativeWait struct {
+	id    string
+	since time.Time
+}
+
+type nativeWatch struct {
+	mu      sync.Mutex
+	waiting map[uint32]nativeWait
+}
+
+func newNativeWatch() *nativeWatch { return &nativeWatch{waiting: map[uint32]nativeWait{}} }
+
+func (w *nativeWatch) add(stream uint32, id string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.waiting[stream] = nativeWait{id: id, since: time.Now()}
+}
+
+// done reports how long the stream waited, and whether it was being watched at
+// all -- a transcript for an unwatched stream is itself worth seeing, because it
+// means one arrived before the audio did.
+func (w *nativeWatch) done(stream uint32) (time.Duration, string, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	entry, ok := w.waiting[stream]
+	if !ok {
+		return 0, "", false
+	}
+	delete(w.waiting, stream)
+	return time.Since(entry.since), entry.id, true
+}
+
+// overdue returns the streams still waiting, and drops those past the window so
+// a diagnostic cannot log forever.
+func (w *nativeWatch) overdue() (still []string, gaveUp []string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for stream, entry := range w.waiting {
+		waited := time.Since(entry.since)
+		line := fmt.Sprintf("%s (stream %d) after %s", entry.id, stream, waited.Round(time.Second))
+		if waited > nativeWatchFor {
+			delete(w.waiting, stream)
+			gaveUp = append(gaveUp, line)
+			continue
+		}
+		still = append(still, line)
+	}
+	sort.Strings(still)
+	sort.Strings(gaveUp)
+	return still, gaveUp
+}
+
+// watchNative reports what is still waiting until the connection ends.
+func (s *Service) watchNative(ctx context.Context, done <-chan struct{}, w *nativeWatch) {
+	ticker := time.NewTicker(nativeWatchEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			still, gaveUp := w.overdue()
+			for _, line := range gaveUp {
+				s.log("native: no transcript for %s -- giving up after %s", line, nativeWatchFor)
+			}
+			for _, line := range still {
+				s.log("native: still no transcript for %s", line)
+			}
+		}
+	}
+}
+
 // Every connection owns its stream ID namespace, including early native events.
 func (s *Service) connections(ctx context.Context, fail func(error)) error {
 	delay := time.Second
 	for ctx.Err() == nil {
 		received := map[uint32]string{}
 		early := map[uint32]string{}
+		watch := newNativeWatch()
 		cb := channel.Callbacks{
 			State: func(online bool) {
 				if online {
@@ -184,6 +282,7 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 					clear(received)
 				}
 				received[in.StreamID] = id
+				watch.add(in.StreamID, id)
 				if text, ok := early[in.StreamID]; ok {
 					delete(early, in.StreamID)
 					s.complete(durable, id, text, true, fail)
@@ -214,7 +313,21 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 			},
 			Transcript: func(t channel.Transcript) {
 				text := strings.TrimSpace(t.Text)
+				// Logged before anything is decided. The truncated case used to
+				// return here in silence, which is why "Zello never sends one"
+				// and "Zello always sends a truncated one" looked identical.
+				waited, id, watched := watch.done(t.StreamID)
+				switch {
+				case watched:
+					s.log("native: transcript for %s (stream %d) after %s: %d chars, truncated=%v",
+						id, t.StreamID, waited.Round(time.Millisecond), len(text), t.Truncated)
+				default:
+					s.log("native: transcript for unwatched stream %d: %d chars, truncated=%v",
+						t.StreamID, len(text), t.Truncated)
+				}
 				if t.Truncated || text == "" {
+					s.log("native: transcript for stream %d discarded (truncated=%v, empty=%v)",
+						t.StreamID, t.Truncated, text == "")
 					return
 				}
 				if id, ok := received[t.StreamID]; ok {
@@ -233,7 +346,10 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 		s.current = client
 		s.mu.Unlock()
 		began := time.Now()
+		closed := make(chan struct{})
+		go s.watchNative(ctx, closed, watch)
 		err := client.Run(ctx)
+		close(closed)
 		if ctx.Err() != nil {
 			return nil
 		}
