@@ -229,7 +229,21 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 		received := map[uint32]string{}
 		early := map[uint32]string{}
 		watch := newNativeWatch()
+		matcher := newNativeMatcher(s.NativeGrace)
+		expedite := func(id string) {
+			if id == "" {
+				return
+			}
+			if err := s.Store.ExpediteIncoming(ctx, id); err != nil {
+				fail(errors.New("cannot schedule incoming fallback"))
+				return
+			}
+			s.log("incoming %s native association ambiguous; scheduling full-audio fallback", id)
+			s.signal(s.incoming)
+		}
 		cb := channel.Callbacks{
+			VoiceStart: func(streamID uint32) { expedite(matcher.start(streamID)) },
+			Transmit:   func(active bool) { expedite(matcher.transmit(active)) },
 			State: func(online bool) {
 				if online {
 					s.log("Zello connected")
@@ -261,8 +275,9 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 					fail(errors.New("cannot persist incoming message"))
 					return
 				}
-				s.log("incoming %s saved", id)
+				s.log("incoming %s saved (stream %d)", id, in.StreamID)
 				if saveErr != nil || in.Err != nil {
+					matcher.finish(in.StreamID, id, false)
 					reason := "incoming audio was incomplete; transcription withheld"
 					if saveErr != nil {
 						reason = "incoming audio retained as raw transport data: invalid or unsupported stream"
@@ -280,9 +295,13 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 				}
 				received[in.StreamID] = id
 				watch.add(in.StreamID, id)
+				eligible := matcher.finish(in.StreamID, id, true)
 				if text, ok := early[in.StreamID]; ok {
-					s.complete(durable, id, text, true, fail)
+					matcher.keyed(in.StreamID)
+					s.complete(durable, id, text, "native_stream_id", fail)
 					forgetNative(in.StreamID, received, early, watch)
+				} else if !eligible {
+					expedite(id)
 				}
 				s.signal(s.incoming)
 			},
@@ -313,21 +332,26 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 			},
 			Transcript: func(t channel.Transcript) {
 				text := strings.TrimSpace(t.Text)
+				if t.StreamID == 0 {
+					candidate := matcher.take(!t.Truncated && text != "")
+					if candidate.id != "" {
+						s.complete(ctx, candidate.id, text, "native_inferred", fail)
+						forgetNative(candidate.stream, received, early, watch)
+					} else {
+						s.log("native: transcript without a stream ID ignored; no eligible sole candidate, using full-audio fallback")
+					}
+					return
+				}
 				if t.Truncated || text == "" {
 					s.log("native: transcript for stream %d discarded (truncated=%v, empty=%v)",
 						t.StreamID, t.Truncated, text == "")
 					return
 				}
-				if t.StreamID == 0 {
-					// Even a sole waiting message is not proof of identity: this
-					// could be another active stream, a duplicate, or a late event.
-					s.log("native: transcript without a stream ID ignored; using full-audio fallback")
-					return
-				}
 				if id, ok := received[t.StreamID]; ok {
 					s.log("native: transcript for %s (stream %d): %d chars, confidence=%.2f",
 						id, t.StreamID, len(text), t.Confidence)
-					s.complete(ctx, id, text, true, fail)
+					matcher.keyed(t.StreamID)
+					s.complete(ctx, id, text, "native_stream_id", fail)
 					forgetNative(t.StreamID, received, early, watch)
 					return
 				}
@@ -368,7 +392,7 @@ func (s *Service) connections(ctx context.Context, fail func(error)) error {
 	}
 	return nil
 }
-func (s *Service) complete(ctx context.Context, id, text string, native bool, fail func(error)) {
+func (s *Service) complete(ctx context.Context, id, text, source string, fail func(error)) {
 	err := s.Store.CompleteIncoming(ctx, id, text)
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, context.Canceled) {
 		return
@@ -377,11 +401,11 @@ func (s *Service) complete(ctx context.Context, id, text string, native bool, fa
 		fail(errors.New("cannot persist incoming transcription"))
 		return
 	}
-	if native {
+	if strings.HasPrefix(source, "native_") {
 		s.native.Store(true)
 	}
 	s.socket.Notify()
-	s.log("incoming %s transcribed", id)
+	s.log("incoming %s transcribed (source=%s)", id, source)
 }
 func (s *Service) transcriptions(ctx context.Context) error {
 	timer := time.NewTicker(500 * time.Millisecond)
@@ -421,7 +445,7 @@ func (s *Service) transcriptions(ctx context.Context) error {
 				continue
 			}
 			var completeErr error
-			s.complete(ctx, m.ID, text, false, func(err error) { completeErr = err })
+			s.complete(ctx, m.ID, text, "openai", func(err error) { completeErr = err })
 			if completeErr != nil {
 				return completeErr
 			}

@@ -1,5 +1,6 @@
 // Package channel implements the Zello Channel API voice transport. Callbacks
 // run synchronously: they must return promptly and leave network work to workers.
+// Transmit runs on the send goroutine; other callbacks run on the receive loop.
 package channel
 
 import (
@@ -58,6 +59,8 @@ type TextMessage struct {
 }
 
 type Callbacks struct {
+	VoiceStart func(streamID uint32)
+	Transmit   func(active bool)
 	Audio      func(Incoming)
 	Transcript func(Transcript)
 	Text       func(TextMessage)
@@ -309,6 +312,10 @@ func (s *session) request(ctx context.Context, fields map[string]any) (envelope,
 // A successful return means frames and stop_stream were written, not proof that
 // any particular handset played them (the API provides no playback receipt).
 func (c *Client) Send(ctx context.Context, header []byte, duration time.Duration, packets [][]byte) error {
+	if c.cb.Transmit != nil {
+		c.cb.Transmit(true)
+		defer c.cb.Transmit(false)
+	}
 	if err := validateAudio(header, duration); err != nil {
 		return &SendError{Err: err}
 	}
@@ -503,16 +510,12 @@ func (c *Client) read(s *session) error {
 		case "on_error":
 			return errors.New("Zello server reported an error")
 		case "on_transcription":
-			// Temporary, 2026-09-10. The service matches a transcript to its
-			// message by stream_id, and every transcript observed so far has
-			// arrived with stream_id 0 while the audio stream it belongs to had
-			// a real id -- so the lookup never matches and the transcript is
-			// filed under a key nothing claims. Which field actually carries the
-			// identifier is the question; this reports the envelope's shape,
-			// with the transcript text itself replaced by its length so a
-			// diagnostic does not copy what Daniel said into a second place.
+			// Some native events omit both recognized stream-ID spellings.
+			// Capture structure and opaque correlation tokens to determine
+			// whether other metadata can associate them with voice streams.
 			if c.cb.Shape != nil {
 				c.cb.Shape("on_transcription", envelopeShape(data))
+				c.cb.Shape("on_transcription metadata", correlationShape(data))
 			}
 			if c.cb.Transcript != nil {
 				c.cb.Transcript(Transcript{StreamID: e.transcriptStream(), Text: e.Text,
@@ -525,6 +528,10 @@ func (c *Client) read(s *session) error {
 			// looked delivered at one end and never existed at the other.
 			c.deliverText(e)
 		case "on_stream_start":
+			if c.cb.Shape != nil {
+				c.cb.Shape("on_stream_start", envelopeShape(data))
+				c.cb.Shape("on_stream_start metadata", correlationShape(data))
+			}
 			if e.Type != "audio" || e.Channel != c.cfg.Channel {
 				continue
 			}
@@ -533,6 +540,9 @@ func (c *Client) read(s *session) error {
 			}
 			if len(streams) >= maxStreams {
 				return errors.New("too many concurrent Zello streams")
+			}
+			if c.cb.VoiceStart != nil {
+				c.cb.VoiceStart(e.StreamID)
 			}
 			header, err := base64.StdEncoding.DecodeString(e.CodecHeader)
 			duration := time.Duration(e.PacketDuration * float64(time.Millisecond))

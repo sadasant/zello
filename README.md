@@ -184,27 +184,79 @@ starts only after successful authentication and an online channel notification.
 
 Incoming audio is preserved before transcription. The service requests native
 transcriptions and accepts a complete, nonempty event whose `stream_id` or
-`streamId` identifies the corresponding incoming stream. Events without a usable
-stream ID are logged as uncorrelated and use the saved-audio fallback; arrival
-order does not establish which message was transcribed. The service waits up to
-three seconds after audio completion for an identified native event, then uses
-OpenAI audio transcription with `gpt-4o-mini-transcribe` (or the configured model).
-A partial native event is never treated as a complete message.
+`streamId` identifies the corresponding incoming stream. When Zello omits the ID,
+the service can infer an association with one recent recording using the bounded
+rule below. It waits up to three seconds after audio completion, then uses OpenAI
+audio transcription with `gpt-4o-mini-transcribe` (or the configured model).
+A partial or empty native event is never treated as a complete message.
 The first completed transcript wins, so late events cannot rewrite consumed text.
 No chat or completion API is involved.
+
+### Native transcripts without a stream ID
+
+Some observed Zello Work incoming transcription events omit both stream-ID
+spellings. In the observed network, their `sender` value also equals the channel
+name rather than the audio sender's username. Outgoing transcription events have
+included `streamId`. These are observations, not protocol guarantees; neither
+sender matching nor FIFO pairing is assumed.
+
+The service applies this single-candidate heuristic inside each connection:
+
+1. Observe the start and completion of one valid incoming recording, with no
+   other recording or outgoing transmission involved. Hold it as the sole
+   candidate for at most three seconds after completion.
+2. Accept a complete, nonempty unidentified transcript during that window if
+   no other voice stream has started. Record the successful association as
+   `source=native_inferred` in the log.
+3. If another recording starts first, immediately make the old recording
+   eligible for OpenAI fallback and wake the transcription worker. The new
+   recording is also ineligible for inferred matching. Its audio still records
+   normally and becomes eligible for fallback when complete. Receiving audio
+   never waits for an OpenAI request to finish.
+4. During ambiguity, discard unidentified native transcripts. Resume optimistic
+   matching only for a recording that starts after five quiet seconds with no
+   active incoming or outgoing voice. Voice starts/stops and unidentified events
+   extend that interval. A recording that started during quarantine stays
+   ineligible even if it ends after the interval.
+
+An expired candidate, a rejected recording, an unidentified partial/orphan event,
+or an outgoing send attempt also triggers quarantine. After a successful native
+association, the five-second quiet interval guards against duplicate events being
+assigned to the next recording. For timeouts, the interval starts at the expired
+deadline. No background timer is needed for this bookkeeping: event handlers
+compare timestamps, while the existing worker handles durable fallback deadlines.
+
+This trades some certainty for faster conversational transcripts. Zello has not
+provided an upper bound on native-transcription delay: an old unidentified event
+arriving after the quiet interval while a new candidate is pending can still be
+misassociated. Five seconds is a local heuristic, not a Zello delivery guarantee.
+The original audio is retained. Explicitly identified native events remain usable
+during quarantine, and matching state never crosses a connection boundary.
+
+Successful completion logs distinguish `source=native_stream_id`,
+`source=native_inferred`, and `source=openai`. These are diagnostic log fields;
+the CLI message schema is unchanged. `native_transcription_observed` includes
+successful inferred matches. Restarting loses only temporary matching state:
+saved pending audio remains eligible for OpenAI, and unread text stays durable.
+
+### Durable inbox and delivery
 
 A pending transcription stays durable but is excluded from the unread inbox
 until text is ready. Failed transcription attempts retry with backoff up to five
 minutes, including after restart. A missing OpenAI key leaves the audio pending
-unless a native transcript with a matching stream ID arrives. IDs and deferred
+unless a native transcript is accepted under the rules above. IDs and deferred
 errors are recorded in the log and can be inspected with `show`.
 Broken/incomplete received streams are
 retained with an error and withheld from normal consumption.
 
 Typed Zello messages are stored with their text and ready state in one database
 transaction. They appear in the same unread inbox immediately, survive restart,
-and need neither audio nor transcription. Native diagnostics log only selected
-metadata and text lengths; nested translations and unknown values are omitted.
+and need neither audio nor transcription. Native diagnostics log selected typed
+metadata, text lengths, and bounded event structure. Sender/channel/identifier
+equality can be compared using opaque tokens within one service process; the
+random token key is not persisted. Speech, translations, arbitrary string values,
+and unknown field names are not copied into the log. These diagnostic tokens are
+never used to establish a transcript's identity.
 
 Outgoing state progresses through `queued → synthesizing → sending → sent`.
 Ordinary ElevenLabs HTTP TTS uses the configured voice and `eleven_flash_v2_5` by
