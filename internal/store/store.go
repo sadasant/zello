@@ -239,6 +239,15 @@ func (s *Store) CompleteIncoming(ctx context.Context, id, text string) error {
 		WHERE id=? AND direction='incoming' AND status='unread' AND transcription_status='pending'`, text, id))
 }
 
+// ExpediteIncoming makes a saved recording eligible for fallback immediately
+// when a new stream invalidates its native-transcript waiting window.
+func (s *Store) ExpediteIncoming(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET next_transcription_at=0
+		WHERE id=? AND direction='incoming' AND transcription_status='pending'
+		AND transcription_attempts=0`, id)
+	return err
+}
+
 func (s *Store) FailIncoming(ctx context.Context, id, detail string) error {
 	// Retry indefinitely with a bounded delay; neither audio nor unread state is lost.
 	return changed(s.db.ExecContext(ctx, `UPDATE messages

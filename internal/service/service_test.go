@@ -53,6 +53,8 @@ func (f *speechFake) Synthesize(ctx context.Context, text, path string) error {
 }
 
 type transportEvent struct {
+	start      uint32
+	transmit   *bool
 	text       *channel.TextMessage
 	done       chan struct{}
 	audio      *channel.Incoming
@@ -81,6 +83,12 @@ func (f *transportFake) Run(ctx context.Context) error {
 		case err := <-f.failure:
 			return err
 		case e := <-f.events:
+			if e.start != 0 {
+				f.cb.VoiceStart(e.start)
+			}
+			if e.transmit != nil {
+				f.cb.Transmit(*e.transmit)
+			}
 			if e.audio != nil {
 				f.cb.Audio(*e.audio)
 			}
@@ -97,6 +105,10 @@ func (f *transportFake) Run(ctx context.Context) error {
 	}
 }
 func (f *transportFake) Send(ctx context.Context, header []byte, duration time.Duration, packets [][]byte) error {
+	if f.cb.Transmit != nil {
+		f.cb.Transmit(true)
+		defer f.cb.Transmit(false)
+	}
 	if f.send != nil {
 		return f.send(ctx)
 	}
@@ -654,7 +666,7 @@ func deliver(t *testing.T, tr *transportFake, event transportEvent) {
 	}
 }
 
-func TestIdentifierlessNativeAlwaysUsesFullAudioFallback(t *testing.T) {
+func TestIdentifierlessNativeWithoutObservedStartUsesFullAudioFallback(t *testing.T) {
 	for _, order := range []string{"before audio", "after audio"} {
 		t.Run(order, func(t *testing.T) {
 			f := makeFixture(t)
@@ -706,6 +718,7 @@ func TestSecondActiveStreamsIdentifierlessTranscriptCannotCompleteTheFirst(t *te
 	first.Sender = "first-speaker"
 	second.StreamID = 43
 	second.Sender = "second-speaker"
+	deliver(t, tr, transportEvent{start: first.StreamID})
 	deliver(t, tr, transportEvent{audio: &first})
 	select {
 	case <-started:
@@ -714,6 +727,7 @@ func TestSecondActiveStreamsIdentifierlessTranscriptCannotCompleteTheFirst(t *te
 	}
 	// B is still active: channel.Audio is emitted only when that stream stops.
 	// Its native text overtakes B's stop while A remains pending.
+	deliver(t, tr, transportEvent{start: second.StreamID})
 	deliver(t, tr, transportEvent{transcript: &channel.Transcript{Text: "second native text"}})
 	if n, err := f.db.Count(context.Background()); err != nil || n != 0 {
 		t.Fatal("second stream's text completed the first message")
@@ -740,8 +754,10 @@ func TestRejectedAudioLateIdentifierlessTranscriptCannotAttachToNextAudio(t *tes
 	rejected.Header = []byte{1, 2, 3}
 	valid.StreamID = 43
 	valid.Sender = "next-speaker"
+	deliver(t, tr, transportEvent{start: rejected.StreamID})
 	deliver(t, tr, transportEvent{audio: &rejected})
 	deliver(t, tr, transportEvent{transcript: &channel.Transcript{Text: "words from rejected audio"}})
+	deliver(t, tr, transportEvent{start: valid.StreamID})
 	deliver(t, tr, transportEvent{audio: &valid})
 	m := unread(t, f, "fallback transcription")
 	if m.Sender != "next-speaker" || s.native.Load() || f.speech.transcriptions.Load() != 1 {

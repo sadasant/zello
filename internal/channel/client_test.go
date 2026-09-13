@@ -95,6 +95,7 @@ func receive[T any](t *testing.T, ch <-chan T) T {
 
 func TestReceivesAudioAndNativeTranscriptions(t *testing.T) {
 	got := make(chan Incoming, 1)
+	starts := make(chan uint32, 1)
 	transcripts := make(chan Transcript, 2)
 	endpoint := testServer(t, func(conn *websocket.Conn) {
 		login(t, conn)
@@ -106,7 +107,17 @@ func TestReceivesAudioAndNativeTranscriptions(t *testing.T) {
 		_ = conn.WriteJSON(map[string]any{"command": "on_transcription", "stream_id": 42, "text": "Can you hear me?", "truncated": false})
 		_, _, _ = conn.ReadMessage()
 	})
-	_, cancel, result := newTestClient(t, endpoint, Callbacks{Audio: func(v Incoming) { got <- v }, Transcript: func(v Transcript) { transcripts <- v }})
+	_, cancel, result := newTestClient(t, endpoint, Callbacks{VoiceStart: func(id uint32) { starts <- id }, Audio: func(v Incoming) {
+		select {
+		case id := <-starts:
+			if id != v.StreamID {
+				t.Error("start callback had wrong stream ID")
+			}
+		default:
+			t.Error("audio completed before its start was reported")
+		}
+		got <- v
+	}, Transcript: func(v Transcript) { transcripts <- v }})
 	incoming := receive(t, got)
 	if incoming.Err != nil || incoming.StreamID != 42 || incoming.Sender != "human" || incoming.Channel != "test-channel" || incoming.PacketDuration != 20*time.Millisecond || !bytes.Equal(incoming.Header, testHeader) {
 		t.Fatalf("bad incoming metadata: %+v", incoming)
@@ -128,6 +139,7 @@ func TestReceivesAudioAndNativeTranscriptions(t *testing.T) {
 
 func TestSendsPacedAudioWithExactFramingAndPongs(t *testing.T) {
 	online := make(chan bool, 2)
+	activity := make(chan bool, 2)
 	observed := make(chan time.Duration, 1)
 	endpoint := testServer(t, func(conn *websocket.Conn) {
 		login(t, conn)
@@ -168,12 +180,15 @@ func TestSendsPacedAudioWithExactFramingAndPongs(t *testing.T) {
 		observed <- time.Since(started)
 		_, _, _ = conn.ReadMessage()
 	})
-	client, cancel, result := newTestClient(t, endpoint, Callbacks{State: func(v bool) { online <- v }})
+	client, cancel, result := newTestClient(t, endpoint, Callbacks{State: func(v bool) { online <- v }, Transmit: func(v bool) { activity <- v }})
 	if !receive(t, online) {
 		t.Fatal("not connected")
 	}
 	if err := client.Send(context.Background(), testHeader, 20*time.Millisecond, [][]byte{{0, 4}, {1, 4}, {2, 4}}); err != nil {
 		t.Fatal(err)
+	}
+	if !receive(t, activity) || receive(t, activity) {
+		t.Fatal("send activity did not bracket transmission")
 	}
 	if elapsed := receive(t, observed); elapsed < 50*time.Millisecond {
 		t.Errorf("audio was sent without pacing: %v", elapsed)
